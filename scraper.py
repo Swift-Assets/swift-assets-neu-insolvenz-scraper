@@ -29,6 +29,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -522,14 +523,91 @@ class SupabaseClient:
             for r in rows
         }
 
-    def upsert_cases(self, records: list[InsolvencyRecord]) -> tuple[int, int]:
-        """Calls the public.neu_insolvenz_fill_only_upsert(jsonb) RPC, which:
-          - INSERTs new rows (full record).
-          - For existing rows: only fills in NULL/empty fields, never overwrites
-            enrichment data or non-empty values. Updates updated_at.
-        Returns (rows_affected, errors)."""
-        if not records:
+    # PostgreSQL duplicate-key SQLSTATE returned by PostgREST as JSON "code".
+    # Treated as a *non-fatal* conflict at chunk level: we retry the chunk
+    # row-by-row and only count the actually-conflicting rows.
+    _PG_UNIQUE_VIOLATION = "23505"
+
+    @staticmethod
+    def _is_duplicate_key_error(status_code: int, body_text: str) -> bool:
+        """Detect a PostgREST duplicate-key error reliably.
+
+        We require BOTH the HTTP 409 status *and* the PG SQLSTATE 23505 in
+        the body, so that other 409s (e.g. concurrent-update conflicts) are
+        still treated as fatal until we explicitly classify them.
+        """
+        if status_code != 409:
+            return False
+        try:
+            payload = json.loads(body_text)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if isinstance(payload, dict):
+            return payload.get("code") == SupabaseClient._PG_UNIQUE_VIOLATION
+        return False
+
+    def _post_rpc(self, endpoint: str, headers: dict, payload: list[dict],
+                  timeout: int) -> tuple[int, str]:
+        """Single RPC call. Returns (status_code, response_text). Network
+        exceptions are re-raised so callers can decide how to count them."""
+        resp = requests.post(
+            endpoint,
+            json={"p_records": payload},
+            headers=headers,
+            timeout=timeout,
+        )
+        return resp.status_code, resp.text
+
+    @staticmethod
+    def _parse_counts(body_text: str) -> tuple[int, int]:
+        """Extract (rows_inserted, rows_updated) from a successful RPC body."""
+        try:
+            body = json.loads(body_text)
+        except (json.JSONDecodeError, ValueError):
             return 0, 0
+        if isinstance(body, list) and body and isinstance(body[0], dict):
+            row = body[0]
+        elif isinstance(body, dict):
+            row = body
+        else:
+            return 0, 0
+        return int(row.get("rows_inserted", 0)), int(row.get("rows_updated", 0))
+
+    def upsert_cases(self, records: list[InsolvencyRecord]) -> dict:
+        """Calls the public.neu_insolvenz_fill_only_upsert(jsonb) RPC.
+
+        Behavior
+        --------
+        - Sends records in chunks (default 100).
+        - On chunk **success** (HTTP 2xx): parses ``rows_inserted`` and
+          ``rows_updated`` from the RPC's TABLE return.
+        - On chunk **HTTP 409 duplicate-key** (PG SQLSTATE 23505): the whole
+          chunk is poisoned by even one conflicting row, so we re-send the
+          chunk row-by-row and only count the genuinely-conflicting rows as
+          ``duplicates_skipped``. Non-conflicting rows in the chunk still
+          get inserted/updated normally.
+        - On any **other 4xx/5xx** or network exception: counted as
+          ``real_errors``. Those still cause the run to fail at the caller.
+
+        Returns
+        -------
+        A dict with the following keys:
+            inserted_total, updated_total, duplicates_skipped, real_errors,
+            total_payload_records, chunks_total, chunks_conflict_retried.
+
+        Fill-only semantics are unchanged — they live entirely in the RPC.
+        """
+        result = {
+            "inserted_total": 0,
+            "updated_total": 0,
+            "duplicates_skipped": 0,
+            "real_errors": 0,
+            "total_payload_records": 0,
+            "chunks_total": 0,
+            "chunks_conflict_retried": 0,
+        }
+        if not records:
+            return result
 
         for r in records:
             r.source_run_id = self.run_id
@@ -540,39 +618,97 @@ class SupabaseClient:
             "Content-Type": "application/json",
         }
         payload_all = [r.to_db_dict() for r in records]
+        result["total_payload_records"] = len(payload_all)
 
         CHUNK = 100
-        inserted_total = 0
-        updated_total = 0
-        err_count = 0
         for i in range(0, len(payload_all), CHUNK):
             chunk = payload_all[i:i + CHUNK]
+            result["chunks_total"] += 1
             try:
-                resp = requests.post(
-                    endpoint,
-                    json={"p_records": chunk},
-                    headers=headers,
-                    timeout=120,
-                )
-                if resp.status_code >= 400:
-                    log.error("Upsert RPC failed @%d: %d %s", i, resp.status_code, resp.text[:500])
-                    err_count += len(chunk)
-                else:
-                    body = resp.json()
-                    # RPC returns table(rows_inserted int, rows_updated int)
-                    # PostgREST wraps it as [{"rows_inserted": N, "rows_updated": M}]
-                    if isinstance(body, list) and body and isinstance(body[0], dict):
-                        inserted_total += int(body[0].get("rows_inserted", 0))
-                        updated_total += int(body[0].get("rows_updated", 0))
-                    elif isinstance(body, dict):
-                        inserted_total += int(body.get("rows_inserted", 0))
-                        updated_total += int(body.get("rows_updated", 0))
+                status, body_text = self._post_rpc(endpoint, headers, chunk, timeout=120)
             except requests.RequestException as e:
                 log.error("Upsert exception @%d: %s", i, e)
-                err_count += len(chunk)
-        log.info("Upsert summary: inserted=%d updated=%d errors=%d",
-                 inserted_total, updated_total, err_count)
-        return inserted_total + updated_total, err_count
+                result["real_errors"] += len(chunk)
+                continue
+
+            if 200 <= status < 300:
+                ins, upd = self._parse_counts(body_text)
+                result["inserted_total"] += ins
+                result["updated_total"] += upd
+                continue
+
+            if self._is_duplicate_key_error(status, body_text):
+                # One bad row poisoned the whole 100-row chunk. Retry per-row
+                # so the other 99+ rows can land and we count the conflict
+                # precisely.
+                result["chunks_conflict_retried"] += 1
+                log.warning(
+                    "Upsert chunk @%d hit duplicate-key (HTTP 409 / SQLSTATE 23505). "
+                    "Retrying %d rows one-by-one.",
+                    i, len(chunk),
+                )
+                self._retry_single_rows(endpoint, headers, chunk, result, base_index=i)
+                continue
+
+            # Anything else: real failure.
+            log.error(
+                "Upsert RPC failed @%d: %d %s",
+                i, status, body_text[:500],
+            )
+            result["real_errors"] += len(chunk)
+
+        log.info(
+            "Upsert summary: inserted=%d updated=%d duplicates_skipped=%d "
+            "real_errors=%d (total=%d, chunks=%d, conflict_retries=%d)",
+            result["inserted_total"], result["updated_total"],
+            result["duplicates_skipped"], result["real_errors"],
+            result["total_payload_records"], result["chunks_total"],
+            result["chunks_conflict_retried"],
+        )
+        return result
+
+    def _retry_single_rows(self, endpoint: str, headers: dict,
+                            chunk: list[dict], result: dict,
+                            base_index: int) -> None:
+        """Retry a 409-poisoned chunk one row at a time.
+
+        For each row:
+          - 2xx                          -> counted as inserted/updated
+          - 409 SQLSTATE 23505           -> counted as duplicates_skipped (non-fatal)
+          - other 4xx/5xx or network err -> counted as real_errors
+        """
+        for offset, row in enumerate(chunk):
+            try:
+                status, body_text = self._post_rpc(endpoint, headers, [row], timeout=60)
+            except requests.RequestException as e:
+                log.error("Single-row retry exception @%d: %s", base_index + offset, e)
+                result["real_errors"] += 1
+                continue
+
+            if 200 <= status < 300:
+                ins, upd = self._parse_counts(body_text)
+                result["inserted_total"] += ins
+                result["updated_total"] += upd
+                continue
+
+            if self._is_duplicate_key_error(status, body_text):
+                result["duplicates_skipped"] += 1
+                # Keep this at INFO level; the chunk warning above is the
+                # loud one. A compact row identifier keeps the daily log
+                # auditable without flooding it.
+                key = (
+                    row.get("court"), row.get("case_number"),
+                    row.get("announcement_date"),
+                    row.get("announcement_type_hint"),
+                )
+                log.info("  duplicate-key skipped: %s", key)
+                continue
+
+            log.error(
+                "Single-row retry failed @%d: %d %s",
+                base_index + offset, status, body_text[:300],
+            )
+            result["real_errors"] += 1
 
 
 # ---------------------------------------------------------------------------
@@ -721,11 +857,54 @@ def main() -> int:
         return 0
 
     client = SupabaseClient(supabase_url, supabase_key, run_id)
-    # Upsert all listing rows (cheap insert/no-op for existing ones thanks to UPSERT)
-    ok, err = client.upsert_cases(listing)
-    log.info("=== Upsert: ok=%d err=%d ===", ok, err)
+    # Upsert all listing rows (fill-only on existing thanks to RPC).
+    stats = client.upsert_cases(listing)
+
+    inserted = stats["inserted_total"]
+    updated = stats["updated_total"]
+    dupes = stats["duplicates_skipped"]
+    real_errors = stats["real_errors"]
+    total = stats["total_payload_records"]
+
+    log.info(
+        "=== Upsert final: inserted=%d updated=%d duplicates_skipped=%d "
+        "real_errors=%d (total=%d) ===",
+        inserted, updated, dupes, real_errors, total,
+    )
     log.info("=== Run done: id=%s ===", run_id)
-    return 1 if err > 0 else 0
+
+    # Failure policy ---------------------------------------------------------
+    # 1) Any *real* error (non-409 HTTP, network, transport) -> fail.
+    # 2) Duplicate-key skips are non-fatal in normal volumes (official source
+    #    publishes a few colliding/null-typed rows every day). But if more
+    #    than DUPLICATE_RATIO_THRESHOLD of the payload is skipped as duplicate,
+    #    that signals an upstream or schema regression — fail loudly so the
+    #    daily issue gets opened and someone investigates.
+    DUPLICATE_RATIO_THRESHOLD = 0.10  # 10%
+
+    if real_errors > 0:
+        log.error(
+            "FAIL: %d real (non-duplicate) upsert errors. See above for HTTP details.",
+            real_errors,
+        )
+        return 1
+
+    if total > 0 and dupes / total > DUPLICATE_RATIO_THRESHOLD:
+        log.error(
+            "FAIL: duplicate-key skips %d/%d = %.1f%% exceeds threshold %.0f%%. "
+            "This usually means a schema/key regression — investigate.",
+            dupes, total, 100.0 * dupes / total,
+            100.0 * DUPLICATE_RATIO_THRESHOLD,
+        )
+        return 1
+
+    if dupes > 0:
+        log.info(
+            "Note: %d duplicate-key rows skipped (%.2f%% of payload) — within "
+            "acceptable threshold, treating run as success.",
+            dupes, 100.0 * dupes / max(total, 1),
+        )
+    return 0
 
 
 if __name__ == "__main__":
