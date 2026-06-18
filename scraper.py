@@ -542,7 +542,8 @@ class SupabaseClient:
         payload_all = [r.to_db_dict() for r in records]
 
         CHUNK = 100
-        ok_count = 0
+        inserted_total = 0
+        updated_total = 0
         err_count = 0
         for i in range(0, len(payload_all), CHUNK):
             chunk = payload_all[i:i + CHUNK]
@@ -558,16 +559,20 @@ class SupabaseClient:
                     err_count += len(chunk)
                 else:
                     body = resp.json()
-                    if isinstance(body, dict):
-                        ok_count += int(body.get("rows_affected", len(chunk)))
-                    elif isinstance(body, list):
-                        ok_count += len(body)
-                    else:
-                        ok_count += len(chunk)
+                    # RPC returns table(rows_inserted int, rows_updated int)
+                    # PostgREST wraps it as [{"rows_inserted": N, "rows_updated": M}]
+                    if isinstance(body, list) and body and isinstance(body[0], dict):
+                        inserted_total += int(body[0].get("rows_inserted", 0))
+                        updated_total += int(body[0].get("rows_updated", 0))
+                    elif isinstance(body, dict):
+                        inserted_total += int(body.get("rows_inserted", 0))
+                        updated_total += int(body.get("rows_updated", 0))
             except requests.RequestException as e:
                 log.error("Upsert exception @%d: %s", i, e)
                 err_count += len(chunk)
-        return ok_count, err_count
+        log.info("Upsert summary: inserted=%d updated=%d errors=%d",
+                 inserted_total, updated_total, err_count)
+        return inserted_total + updated_total, err_count
 
 
 # ---------------------------------------------------------------------------
