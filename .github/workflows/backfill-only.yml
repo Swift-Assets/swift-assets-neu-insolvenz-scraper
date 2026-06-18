@@ -1,0 +1,32 @@
+name: Run Swift V2 Backfill Only
+
+# Manual-only utility workflow that runs the entity backfill RPC without
+# touching the scraper. Useful for:
+#   - testing the new step in isolation
+#   - re-running the backfill after a manual scraper invocation in the SQL editor
+#   - catching up after a transient failure
+#
+# Uses the same secrets and script as the daily workflow.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Swift V2 entity backfill
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python scripts/run_swift_v2_backfill.py
