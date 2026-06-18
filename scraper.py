@@ -430,8 +430,10 @@ class NeuInsolvenzScraper:
     # ----- Detail fetch (serialized inside one session) ---------------------
 
     def fetch_detail_text(self, row_index: int, button_id: str) -> str:
-        """Two-step: AJAX click on row, then GET text.xhtml. Must be serialized
-        within a single session since the server caches the last clicked row."""
+        """Single AJAX call: the response itself contains the full announcement
+        text inside <input id='frm_text:ihd_text' value='...'/>. This is more
+        reliable than the secondary GET /ap/text.xhtml call (which depends on
+        server-side state and can race under concurrency)."""
         with self._lock:
             ajax_payload = {
                 f"tbl_ergebnis:{row_index}:frm_detail": f"tbl_ergebnis:{row_index}:frm_detail",
@@ -451,24 +453,32 @@ class NeuInsolvenzScraper:
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 "Referer": f"{BASE_URL}{RESULT_PATH}",
             }
-            self._request("POST", f"{BASE_URL}{RESULT_PATH}", data=ajax_payload, headers=headers)
+            resp = self._request("POST", f"{BASE_URL}{RESULT_PATH}", data=ajax_payload, headers=headers)
 
-            # Update view state if AJAX returned one
-            # (Not strictly required for subsequent clicks but keeps things fresh)
+            # Extract text from the partial-response XML directly
+            import html as html_module
+            m = re.search(
+                r'<input[^>]*id="frm_text:ihd_text"[^>]*value="([^"]*)"',
+                resp.text,
+                re.DOTALL,
+            )
+            if m:
+                text = html_module.unescape(m.group(1))
+                return re.sub(r"\n{3,}", "\n\n", text).strip()
 
+            # Fallback: try secondary GET (legacy path)
             x = random.random()
-            resp = self._request("GET", f"{BASE_URL}{TEXT_PATH}?x={x}")
-            soup = BeautifulSoup(resp.text, "html.parser")
+            resp2 = self._request("GET", f"{BASE_URL}{TEXT_PATH}?x={x}")
+            soup = BeautifulSoup(resp2.text, "html.parser")
+            pre = soup.find("pre", id="veroefftext")
+            if pre:
+                text = pre.get_text("\n", strip=True)
+                return re.sub(r"\n{3,}", "\n\n", text).strip()
             for tag in soup(["script", "style", "noscript"]):
                 tag.decompose()
-            container = (
-                soup.find(id="inhalt")
-                or soup.find("div", {"class": "inhalt"})
-                or soup.body
-                or soup
-            )
+            container = soup.find(id="inhalt") or soup.body or soup
             text = container.get_text("\n", strip=True)
-            return re.sub(r"\n{3,}", "\n\n", text)
+            return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 # ---------------------------------------------------------------------------
