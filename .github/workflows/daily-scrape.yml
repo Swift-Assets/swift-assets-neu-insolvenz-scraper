@@ -43,6 +43,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run scraper
+        id: scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -52,6 +53,19 @@ jobs:
           DETAIL_WORKERS: "4"
         run: |
           python scraper.py
+
+      # Option 1 (temporary): scraper still writes to public.apify_cases.
+      # After it succeeds, copy / link the new neu_insolvenz_direct rows into
+      # the Swift V2 entity architecture via:
+      #   swift_v2.backfill_neu_insolvenz_direct_entities(null)
+      # If this step fails the whole workflow fails (see docs/option-1-backfill-automation-report.md).
+      - name: Run Swift V2 entity backfill
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python scripts/run_swift_v2_backfill.py
 
       - name: Notify on failure
         if: failure()
