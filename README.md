@@ -39,7 +39,7 @@ GET  /ap/text.xhtml    (النص الكامل)
 - تاريخ الافتتاح (`opening_date`)
 - موعد تقديم المطالبات (`claims_deadline`)
 - نوع الإعلان (`announcement_type_hint`: Eröffnung / Aufhebung / etc.)
-- مرحلة الإفلاس (`insolvency_phase`) وعلامة قابلية الاستحواذ (`is_pre_verteilung`) — تُستخرَج من النص الكامل
+- مرحلة الإفلاس (`insolvency_phase`) وعلامة قابلية الاستحواذ (`is_pre_verteilung`) — تُستخرَج من النص الكامل وتُكتَب افتراضياً في قاعدة البيانات (العمودان موجودان في `apify_cases`؛ الـ RPC يكتبهما fill-only)
 - المحكمة والسجل التجاري (HRA/HRB/PR/VR + رقم)
 
 #### تصنيف المرحلة (`insolvency_phase` / `is_pre_verteilung`)
@@ -117,7 +117,7 @@ python scraper.py
 | `DETAIL_WORKERS` | 4 | عدد العمّال المتوازيين |
 | `DRY_RUN` | — | `1` للاختبار بدون كتابة |
 | `SKIP_DETAILS` | — | `1` لتخطّي مرحلة التفاصيل |
-| `WRITE_PHASE_FIELDS` | — | `1` لكتابة عمودَي `insolvency_phase` و`is_pre_verteilung` (افتراضياً مُعطّل: يُحتسبان دائماً لكن لا يُرسلان إلى قاعدة البيانات إلا عند وجود العمودين في `apify_cases`) |
+| `WRITE_PHASE_FIELDS` | `1` (مُفعّل) | كتابة عمودَي `insolvency_phase` و`is_pre_verteilung` (موجودان الآن في `apify_cases`). الافتراضي مُفعّل؛ اضبطه على `0` لتعطيله (يبقى الحقلان محسوبَين ويظهران في DRY_RUN) |
 
 ## الأداء المتوقع
 

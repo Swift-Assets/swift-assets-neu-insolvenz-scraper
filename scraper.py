@@ -25,10 +25,10 @@ Environment variables:
     DETAIL_WORKERS              — int (default: 4)
     DRY_RUN                     — "1" to skip DB writes
     SKIP_DETAILS                — "1" to only upsert listing-level data
-    WRITE_PHASE_FIELDS          — "1" to also write insolvency_phase /
-                                  is_pre_verteilung columns (default off:
-                                  computed but not sent to the DB unless the
-                                  columns exist on apify_cases)
+    WRITE_PHASE_FIELDS          — default ON: write insolvency_phase /
+                                  is_pre_verteilung columns (they exist on
+                                  apify_cases). Set to "0" to disable; fields
+                                  are still computed and shown in DRY_RUN.
 """
 
 from __future__ import annotations
@@ -70,11 +70,11 @@ DEFAULT_DETAIL_WORKERS = 4
 DEFAULT_MAX_DETAIL_FETCHES = 1500
 DETAIL_FETCH_DELAY_SEC = 0.2   # per worker
 
-# Only write the computed phase columns (insolvency_phase, is_pre_verteilung)
-# to the DB when their columns are known to exist. Default off so the scraper
-# never breaks the fill-only upsert on a DB that lacks the columns; the fields
-# are still computed and visible in DRY_RUN output.
-WRITE_PHASE_FIELDS = os.getenv("WRITE_PHASE_FIELDS") == "1"
+# Write the computed phase columns (insolvency_phase, is_pre_verteilung) to the
+# DB. The columns exist on public.apify_cases and the fill-only RPC accepts
+# them, so the safe default is ON. Set WRITE_PHASE_FIELDS=0 to disable (the
+# fields are still computed and shown in DRY_RUN output).
+WRITE_PHASE_FIELDS = os.getenv("WRITE_PHASE_FIELDS", "1") != "0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,10 +136,11 @@ class InsolvencyRecord:
         # Drop internal fields
         d.pop("_row_index", None)
         d.pop("_button_id", None)
-        # The phase fields are always computed (and used in dry-run output), but
-        # only sent to the DB when WRITE_PHASE_FIELDS=1 confirms the columns
-        # exist on public.apify_cases. This keeps the fill-only upsert from
-        # failing on deployments where the columns have not been added yet.
+        # The phase fields are always computed (and used in dry-run output) and
+        # sent to the DB by default (the columns exist on public.apify_cases and
+        # the fill-only RPC accepts them). is_pre_verteilung is kept as a native
+        # bool here so the JSON payload carries a true boolean (the RPC checks
+        # jsonb_typeof = 'boolean'). Set WRITE_PHASE_FIELDS=0 to omit them.
         if not WRITE_PHASE_FIELDS:
             d.pop("insolvency_phase", None)
             d.pop("is_pre_verteilung", None)
