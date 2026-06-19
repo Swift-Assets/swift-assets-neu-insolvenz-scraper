@@ -39,7 +39,14 @@ GET  /ap/text.xhtml    (النص الكامل)
 - تاريخ الافتتاح (`opening_date`)
 - موعد تقديم المطالبات (`claims_deadline`)
 - نوع الإعلان (`announcement_type_hint`: Eröffnung / Aufhebung / etc.)
+- مرحلة الإفلاس (`insolvency_phase`) وعلامة قابلية الاستحواذ (`is_pre_verteilung`) — تُستخرَج من النص الكامل
 - المحكمة والسجل التجاري (HRA/HRB/PR/VR + رقم)
+
+#### تصنيف المرحلة (`insolvency_phase` / `is_pre_verteilung`)
+يُحلَّل النص الكامل للإعلان:
+- **قبل التوزيع (قابل للاستحواذ، `is_pre_verteilung = true`):** Eröffnung des Insolvenzverfahrens، vorläufige Insolvenzverwaltung، Bestellung des Insolvenzverwalters، Sicherungsmaßnahmen → القيم: `opening` / `preliminary_administration` / `administrator_appointed`
+- **مرحلة متأخرة (غير قابل للاستحواذ، `is_pre_verteilung = false`):** Schlusstermin، Schlussverteilung، Verteilungsverzeichnis، Aufhebung، Einstellung/Abweisung mangels Masse (`dismissed_lack_of_assets`)، Masseunzulänglichkeit (`masseunzulaenglichkeit`)، Restschuldbefreiung
+- المطابقة غير حساسة لحالة الأحرف وتتسامح مع تنويعات الـ Umlaut والمسافات؛ وعند الغموض تبقى القيمة `unknown`.
 
 ### الكتابة في Supabase
 يستخدم RPC مخصص `neu_insolvenz_fill_only_upsert` يضمن:
@@ -49,11 +56,15 @@ GET  /ap/text.xhtml    (النص الكامل)
 - **تحديث `updated_at`** على كل تعديل
 
 ### مفتاح التفرّد (Unique Key)
-يعتمد على القيد الموجود في `apify_cases`:
+مفتاح الهوية المستقر المستخدَم في الـ dedup وإعادة الجلب يعتمد على الحقول المعروفة وقت سحب القائمة فقط (يستثني `announcement_type_hint` لأنه فارغ وقت القائمة ويُملأ لاحقاً)، ويطابق منطق الـ RPC `neu_insolvenz_fill_only_upsert`:
 ```
-(court, case_number, announcement_date, announcement_type_hint,
+(court, case_number, announcement_date,
  registry_court, registry_type, registry_number)
 ```
+`announcement_type_hint` يُعامَل كحقل تعبئة فقط (fill-only) داخل الـ RPC، لا كجزء من المفتاح.
+
+### إعادة جلب النص للسجلات الفارغة (Backfill)
+بالإضافة إلى السجلات الجديدة، يُعيد السكرابر جلب النص الكامل للسجلات الموجودة مسبقاً التي يكون `announcement_text` فيها فارغاً/NULL. تظل هذه السجلات مؤهَّلة في كل تشغيل حتى تُستنفد، ضمن حد `MAX_DETAIL_FETCHES` (1500/تشغيل) بحيث يتوزّع أي تراكم على عدة أيام تلقائياً (الأقدم أولوية للسجلات المتراكمة، ثم الأحدث من الجديدة).
 
 ## الإعداد الأولي (تم بالفعل)
 
@@ -106,6 +117,7 @@ python scraper.py
 | `DETAIL_WORKERS` | 4 | عدد العمّال المتوازيين |
 | `DRY_RUN` | — | `1` للاختبار بدون كتابة |
 | `SKIP_DETAILS` | — | `1` لتخطّي مرحلة التفاصيل |
+| `WRITE_PHASE_FIELDS` | — | `1` لكتابة عمودَي `insolvency_phase` و`is_pre_verteilung` (افتراضياً مُعطّل: يُحتسبان دائماً لكن لا يُرسلان إلى قاعدة البيانات إلا عند وجود العمودين في `apify_cases`) |
 
 ## الأداء المتوقع
 

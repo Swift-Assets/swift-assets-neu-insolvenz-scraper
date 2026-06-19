@@ -25,6 +25,10 @@ Environment variables:
     DETAIL_WORKERS              — int (default: 4)
     DRY_RUN                     — "1" to skip DB writes
     SKIP_DETAILS                — "1" to only upsert listing-level data
+    WRITE_PHASE_FIELDS          — "1" to also write insolvency_phase /
+                                  is_pre_verteilung columns (default off:
+                                  computed but not sent to the DB unless the
+                                  columns exist on apify_cases)
 """
 
 from __future__ import annotations
@@ -66,6 +70,12 @@ DEFAULT_DETAIL_WORKERS = 4
 DEFAULT_MAX_DETAIL_FETCHES = 1500
 DETAIL_FETCH_DELAY_SEC = 0.2   # per worker
 
+# Only write the computed phase columns (insolvency_phase, is_pre_verteilung)
+# to the DB when their columns are known to exist. Default off so the scraper
+# never breaks the fill-only upsert on a DB that lacks the columns; the fields
+# are still computed and visible in DRY_RUN output.
+WRITE_PHASE_FIELDS = os.getenv("WRITE_PHASE_FIELDS") == "1"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -96,6 +106,8 @@ class InsolvencyRecord:
     opening_date: str | None = None
     claims_deadline: str | None = None
     announcement_type_hint: str | None = None
+    insolvency_phase: str | None = None        # see classify_phase()
+    is_pre_verteilung: bool | None = None       # True = potentially acquirable
     scraped_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -105,10 +117,17 @@ class InsolvencyRecord:
     _button_id: str | None = field(default=None, repr=False)
 
     def unique_key(self) -> tuple:
-        """Match the DB unique constraint."""
+        """Stable identity used for dedup and re-fetch matching.
+
+        Intentionally EXCLUDES ``announcement_type_hint``: that field is NULL
+        at listing time and only gets a value after detail-fetch/classification,
+        so including it made the same announcement hash differently before vs
+        after enrichment, breaking dedup and re-fetch matching. The fields below
+        are all known at listing time and mirror the DB RPC's stable-match logic
+        (``neu_insolvenz_fill_only_upsert`` matches on exactly these and treats
+        ``announcement_type_hint`` as a fill-only/guarded column)."""
         return (
             self.court, self.case_number, self.announcement_date,
-            self.announcement_type_hint,
             self.registry_court, self.registry_type, self.registry_number,
         )
 
@@ -117,6 +136,13 @@ class InsolvencyRecord:
         # Drop internal fields
         d.pop("_row_index", None)
         d.pop("_button_id", None)
+        # The phase fields are always computed (and used in dry-run output), but
+        # only sent to the DB when WRITE_PHASE_FIELDS=1 confirms the columns
+        # exist on public.apify_cases. This keeps the fill-only upsert from
+        # failing on deployments where the columns have not been added yet.
+        if not WRITE_PHASE_FIELDS:
+            d.pop("insolvency_phase", None)
+            d.pop("is_pre_verteilung", None)
         # Keep nullable fields part of the unique constraint even if None
         keep_null = {
             "announcement_date", "case_number", "court",
@@ -216,6 +242,93 @@ def detect_announcement_type(text: str) -> str | None:
     return None
 
 
+# ----- Insolvency phase classification --------------------------------------
+#
+# Determines the lifecycle phase of a case from the FULL announcement text and
+# whether the company is still PRE-VERTEILUNG (pre-distribution = potentially
+# acquirable). Returns phase enum values the downstream swift_v2 layer already
+# consumes; when genuinely ambiguous we keep "unknown" rather than guessing.
+
+PHASE_UNKNOWN = "unknown"
+
+
+def _normalize_de(text: str) -> str:
+    """Lower-case and fold umlaut/ß + whitespace variants so keyword matching
+    is tolerant of how the portal spells things (ä/ae, ö/oe, ü/ue, ß/ss)."""
+    t = text.lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t)
+
+
+# Late-stage / "dead" signals — case is winding down or closed, NOT acquirable.
+# (label is matched against the umlaut-folded, whitespace-normalized text)
+LATE_STAGE_SIGNALS: list[tuple[str, str]] = [
+    ("schlusstermin", "schlusstermin"),
+    ("schlussverteilung", "schlussverteilung"),
+    ("verteilungsverzeichnis", "verteilungsverzeichnis"),
+    ("aufhebung des insolvenzverfahrens", "aufhebung"),
+    ("einstellung mangels masse", "dismissed_lack_of_assets"),
+    ("abweisung mangels masse", "dismissed_lack_of_assets"),
+    ("masseunzulaenglichkeit", "masseunzulaenglichkeit"),
+    ("restschuldbefreiung", "restschuldbefreiung"),
+]
+
+# Pre-distribution / still-open signals — case is opening or under
+# administration, company is potentially acquirable. Ordered most-specific
+# first so e.g. preliminary administration wins over a bare "eroeffnung".
+PRE_VERTEILUNG_SIGNALS: list[tuple[str, str]] = [
+    ("vorlaeufige insolvenzverwaltung", "preliminary_administration"),
+    ("vorlaeufiger insolvenzverwalter", "preliminary_administration"),
+    ("vorlaeufige insolvenzverwalterin", "preliminary_administration"),
+    ("anordnung der vorlaeufigen", "preliminary_administration"),
+    ("sicherungsmassnahmen", "preliminary_administration"),
+    ("sicherungsmassnahme", "preliminary_administration"),
+    ("eroeffnung des insolvenzverfahrens", "opening"),
+    ("insolvenzverfahren eroeffnet", "opening"),
+    ("insolvenzverwalter bestellt", "administrator_appointed"),
+    ("insolvenzverwalterin bestellt", "administrator_appointed"),
+    ("bestellung des insolvenzverwalters", "administrator_appointed"),
+    ("bestellung der insolvenzverwalterin", "administrator_appointed"),
+    ("zum insolvenzverwalter", "administrator_appointed"),
+    ("zur insolvenzverwalterin", "administrator_appointed"),
+]
+
+
+def classify_phase(text: str | None) -> tuple[str, bool | None]:
+    """Classify the insolvency phase from the full announcement text.
+
+    Returns ``(phase, is_pre_verteilung)``:
+      - ``phase``            : one of the enum values above, or ``"unknown"``.
+      - ``is_pre_verteilung``: True when an opening/preliminary/administrator
+        signal is present AND no late-stage signal is present; False when any
+        late-stage signal is present; None when the phase is unknown.
+
+    Late-stage signals take precedence: an announcement can mention both the
+    original opening and a closing event, but the presence of any closing
+    signal means the company is no longer acquirable."""
+    if not text or not text.strip():
+        return PHASE_UNKNOWN, None
+
+    norm = _normalize_de(text)
+
+    late_phase: str | None = None
+    for needle, label in LATE_STAGE_SIGNALS:
+        if needle in norm:
+            late_phase = label
+            break
+
+    if late_phase is not None:
+        # Any late-stage signal => not acquirable, regardless of opening text.
+        return late_phase, False
+
+    for needle, label in PRE_VERTEILUNG_SIGNALS:
+        if needle in norm:
+            return label, True
+
+    return PHASE_UNKNOWN, None
+
+
 # ----- Field extraction from full text --------------------------------------
 
 OPENING_PATTERNS = [
@@ -250,11 +363,14 @@ ADMIN_PATTERNS = [
 
 
 def extract_fields_from_text(text: str) -> dict[str, str | None]:
-    out: dict[str, str | None] = {
+    phase, is_pre = classify_phase(text)
+    out: dict[str, Any] = {
         "insolvency_administrator": None,
         "opening_date": None,
         "claims_deadline": None,
         "announcement_type_hint": detect_announcement_type(text),
+        "insolvency_phase": phase,
+        "is_pre_verteilung": is_pre,
     }
     if not text:
         return out
@@ -496,32 +612,51 @@ class SupabaseClient:
             "Authorization": f"Bearer {service_key}",
         }
 
-    def get_existing_keys(self, date_from: date, date_to: date) -> set[tuple]:
-        """Return the set of unique-keys already present in the DB for the date range."""
-        endpoint = f"{self.url}/rest/v1/apify_cases"
-        params = {
-            "select": "court,case_number,announcement_date,announcement_type_hint,registry_court,registry_type,registry_number",
-            "announcement_date": f"gte.{date_from.isoformat()}",
-        }
-        # combine with lte using a second param
-        resp = requests.get(
-            endpoint, params=params,
-            headers={**self.base_headers, "Range-Unit": "items"},
-            timeout=60,
+    @staticmethod
+    def _stable_key_from_row(r: dict) -> tuple:
+        """Build the stable identity tuple from a DB row, matching
+        InsolvencyRecord.unique_key() (announcement_type_hint excluded)."""
+        return (
+            r.get("court"), r.get("case_number"), r.get("announcement_date"),
+            r.get("registry_court"), r.get("registry_type"),
+            r.get("registry_number"),
         )
-        # second filter via additional query
-        endpoint2 = f"{self.url}/rest/v1/apify_cases?select={params['select']}&announcement_date=gte.{date_from.isoformat()}&announcement_date=lte.{date_to.isoformat()}"
-        resp = requests.get(endpoint2, headers=self.base_headers, timeout=60)
+
+    def get_existing_keys(
+        self, date_from: date, date_to: date
+    ) -> tuple[set[tuple], set[tuple]]:
+        """Return existing-row state for the date range.
+
+        Returns ``(existing_keys, empty_text_keys)`` where:
+          - ``existing_keys``   : stable keys already present in the DB.
+          - ``empty_text_keys`` : subset of those whose ``announcement_text`` is
+            NULL/empty — these still need a detail-fetch (BUG 1 backfill).
+
+        The key tuple mirrors InsolvencyRecord.unique_key() exactly so that
+        ``record.unique_key() in existing_keys`` matches reliably."""
+        select = (
+            "court,case_number,announcement_date,registry_court,"
+            "registry_type,registry_number,announcement_text"
+        )
+        endpoint = (
+            f"{self.url}/rest/v1/apify_cases?select={select}"
+            f"&announcement_date=gte.{date_from.isoformat()}"
+            f"&announcement_date=lte.{date_to.isoformat()}"
+        )
+        resp = requests.get(endpoint, headers=self.base_headers, timeout=60)
         if resp.status_code >= 400:
             log.warning("Failed to fetch existing keys: %d %s", resp.status_code, resp.text[:200])
-            return set()
+            return set(), set()
         rows = resp.json() or []
-        return {
-            (r.get("court"), r.get("case_number"), r.get("announcement_date"),
-             r.get("announcement_type_hint"), r.get("registry_court"),
-             r.get("registry_type"), r.get("registry_number"))
-            for r in rows
-        }
+        existing_keys: set[tuple] = set()
+        empty_text_keys: set[tuple] = set()
+        for r in rows:
+            key = self._stable_key_from_row(r)
+            existing_keys.add(key)
+            text = r.get("announcement_text")
+            if text is None or not str(text).strip():
+                empty_text_keys.add(key)
+        return existing_keys, empty_text_keys
 
     # PostgreSQL duplicate-key SQLSTATE returned by PostgREST as JSON "code".
     # Treated as a *non-fatal* conflict at chunk level: we retry the chunk
@@ -765,6 +900,8 @@ def fetch_details_with_pool(
                 rec.opening_date = fields["opening_date"]
                 rec.claims_deadline = fields["claims_deadline"]
                 rec.announcement_type_hint = fields["announcement_type_hint"]
+                rec.insolvency_phase = fields["insolvency_phase"]
+                rec.is_pre_verteilung = fields["is_pre_verteilung"]
                 done += 1
                 with done_lock:
                     nonlocal total_done
@@ -818,25 +955,46 @@ def main() -> int:
         log.warning("No results in range. Done.")
         return 0
 
-    # Phase 2: detail fetching — skip records already in DB
+    # Phase 2: detail fetching.
+    # We detail-fetch two disjoint groups:
+    #   (a) new_records      — rows not yet in the DB.
+    #   (b) backfill_records  — rows already in the DB but with empty/NULL
+    #       announcement_text (BUG 1: previously skipped forever).
+    # The backfill group is eligible EVERY run until drained, and the whole
+    # set is capped by MAX_DETAIL_FETCHES so a large backlog is naturally
+    # rate-limited and spread across daily runs.
     new_records: list[InsolvencyRecord] = listing
+    backfill_records: list[InsolvencyRecord] = []
     if not dry_run and supabase_url and supabase_key:
         client = SupabaseClient(supabase_url, supabase_key, run_id)
-        existing_keys = client.get_existing_keys(date_from, date_to)
-        log.info("Existing DB keys in range: %d", len(existing_keys))
+        existing_keys, empty_text_keys = client.get_existing_keys(date_from, date_to)
+        log.info("Existing DB keys in range: %d (of which empty announcement_text: %d)",
+                 len(existing_keys), len(empty_text_keys))
         new_records = [r for r in listing if r.unique_key() not in existing_keys]
+        # empty_text_keys is already a subset of existing_keys.
+        backfill_records = [r for r in listing if r.unique_key() in empty_text_keys]
         log.info("New (not-yet-in-DB) records: %d / %d total listing rows",
                  len(new_records), len(listing))
+        log.info("Existing rows needing announcement_text backfill: %d", len(backfill_records))
     else:
         log.info("Dry run — skipping DB key check.")
 
     if skip_details:
         log.info("SKIP_DETAILS=1 — not fetching announcement_text.")
     else:
-        to_fetch = new_records[:max_details]
-        if len(new_records) > max_details:
-            log.warning("Capped detail fetches at %d (had %d new records).",
-                        max_details, len(new_records))
+        # Newest-first within each group, then prioritise the empty-text
+        # backlog so it is guaranteed eligible every run until drained, then
+        # fill the remainder of the cap with brand-new rows.
+        def _by_date_desc(recs: list[InsolvencyRecord]) -> list[InsolvencyRecord]:
+            return sorted(recs, key=lambda r: r.announcement_date or "", reverse=True)
+
+        ordered = _by_date_desc(backfill_records) + _by_date_desc(new_records)
+        to_fetch = ordered[:max_details]
+        if len(ordered) > max_details:
+            log.warning(
+                "Capped detail fetches at %d (had %d to fetch: %d backfill + %d new). "
+                "Remaining backlog will be picked up on the next run.",
+                max_details, len(ordered), len(backfill_records), len(new_records))
         if to_fetch:
             log.info("Fetching details for %d records with %d workers...",
                      len(to_fetch), workers)
@@ -854,6 +1012,10 @@ def main() -> int:
             for k, v in sample.to_db_dict().items():
                 preview = (str(v)[:140] + "...") if v and len(str(v)) > 140 else v
                 log.info("  %s = %r", k, preview)
+            # Always surface the computed phase classification in dry-run, even
+            # when WRITE_PHASE_FIELDS is off (so they are excluded from to_db_dict).
+            log.info("  insolvency_phase = %r", sample.insolvency_phase)
+            log.info("  is_pre_verteilung = %r", sample.is_pre_verteilung)
         return 0
 
     client = SupabaseClient(supabase_url, supabase_key, run_id)
