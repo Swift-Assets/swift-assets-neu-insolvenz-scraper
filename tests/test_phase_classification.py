@@ -4,14 +4,17 @@ Run with:  python -m unittest discover -s tests
 (stdlib unittest only — no extra test dependency required.)
 """
 
+import json
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import scraper  # noqa: E402
 from scraper import (  # noqa: E402
     InsolvencyRecord,
+    SupabaseClient,
     classify_phase,
     PHASE_UNKNOWN,
 )
@@ -142,6 +145,90 @@ class TestStableUniqueKey(unittest.TestCase):
         before = self._rec(insolvency_phase=None, is_pre_verteilung=None)
         after = self._rec(insolvency_phase="opening", is_pre_verteilung=True)
         self.assertEqual(before.unique_key(), after.unique_key())
+
+    def test_key_matches_stable_key_from_row(self):
+        rec = self._rec()
+        row = {
+            "court": "Amtsgericht Berlin",
+            "case_number": "36a IN 1234/25",
+            "announcement_date": "2026-03-01",
+            "registry_court": "Berlin (Charlottenburg)",
+            "registry_type": "HRB",
+            "registry_number": "12345",
+        }
+        self.assertEqual(rec.unique_key(), SupabaseClient._stable_key_from_row(row))
+
+    def test_key_normalizes_empty_string_and_whitespace(self):
+        # Regression for M2: a DB value stored as '' or with stray whitespace
+        # must match a scraper-side None / trimmed value, or dedup silently
+        # breaks (the same row looks both "new" and "existing").
+        rec = InsolvencyRecord(
+            court="Amtsgericht Berlin",
+            case_number="36a IN 1234/25",
+            announcement_date="2026-03-01",
+            registry_court=None,        # scraper couldn't parse a register
+            registry_type=None,
+            registry_number=None,
+        )
+        row = {
+            "court": "  Amtsgericht Berlin ",   # stray whitespace in DB
+            "case_number": "36a IN 1234/25",
+            "announcement_date": "2026-03-01",
+            "registry_court": "",                # stored as empty string in DB
+            "registry_type": "",
+            "registry_number": "",
+        }
+        self.assertEqual(rec.unique_key(), SupabaseClient._stable_key_from_row(row))
+
+
+class TestToDbDictPhaseFields(unittest.TestCase):
+    def _rec(self, **kw) -> InsolvencyRecord:
+        base = dict(court="AG Berlin", case_number="1 IN 1/25",
+                    announcement_date="2026-03-01")
+        base.update(kw)
+        return InsolvencyRecord(**base)
+
+    def _with_write_phase(self, value: bool):
+        # to_db_dict reads the module-level WRITE_PHASE_FIELDS at call time.
+        self.addCleanup(setattr, scraper, "WRITE_PHASE_FIELDS",
+                        scraper.WRITE_PHASE_FIELDS)
+        scraper.WRITE_PHASE_FIELDS = value
+
+    def test_is_pre_verteilung_serializes_as_native_bool(self):
+        self._with_write_phase(True)
+        d = self._rec(insolvency_phase="opening", is_pre_verteilung=True).to_db_dict()
+        self.assertIn("is_pre_verteilung", d)
+        self.assertIs(d["is_pre_verteilung"], True)
+        # And survives JSON encoding as a JSON boolean, not a string.
+        self.assertIn('"is_pre_verteilung": true', json.dumps(d))
+
+    def test_is_pre_verteilung_false_is_kept(self):
+        self._with_write_phase(True)
+        d = self._rec(insolvency_phase="aufhebung", is_pre_verteilung=False).to_db_dict()
+        self.assertIs(d["is_pre_verteilung"], False)
+        self.assertIn('"is_pre_verteilung": false', json.dumps(d))
+
+    def test_is_pre_verteilung_none_is_omitted(self):
+        self._with_write_phase(True)
+        d = self._rec(insolvency_phase="opening", is_pre_verteilung=None).to_db_dict()
+        self.assertNotIn("is_pre_verteilung", d)
+
+    def test_unknown_phase_is_omitted(self):
+        # Regression for M1: never send the "unknown" placeholder.
+        self._with_write_phase(True)
+        d = self._rec(insolvency_phase=PHASE_UNKNOWN, is_pre_verteilung=None).to_db_dict()
+        self.assertNotIn("insolvency_phase", d)
+
+    def test_real_phase_is_included(self):
+        self._with_write_phase(True)
+        d = self._rec(insolvency_phase="opening", is_pre_verteilung=True).to_db_dict()
+        self.assertEqual(d["insolvency_phase"], "opening")
+
+    def test_phase_fields_omitted_when_disabled(self):
+        self._with_write_phase(False)
+        d = self._rec(insolvency_phase="opening", is_pre_verteilung=True).to_db_dict()
+        self.assertNotIn("insolvency_phase", d)
+        self.assertNotIn("is_pre_verteilung", d)
 
 
 if __name__ == "__main__":
