@@ -131,9 +131,10 @@ class InsolvencyRecord:
     # transient — not stored in DB, used internally
     _row_index: int = field(default=-1, repr=False)
     _button_id: str | None = field(default=None, repr=False)
-    # DB primary key, only set for existing rows we backfill (so we can bump
-    # detail_fetch_attempts by id afterwards). None for brand-new listing rows.
-    _db_id: int | None = field(default=None, repr=False)
+    # DB primary key (apify_cases.id is a UUID/text), only set for existing rows
+    # we backfill (so we can bump detail_fetch_attempts by id afterwards). None
+    # for brand-new listing rows.
+    _db_id: str | None = field(default=None, repr=False)
 
     def unique_key(self) -> tuple:
         """Stable identity used for dedup and re-fetch matching.
@@ -664,7 +665,7 @@ class SupabaseClient:
 
     def get_existing_keys(
         self, date_from: date, date_to: date, max_attempts: int
-    ) -> tuple[set[tuple], set[tuple], dict[tuple, int]]:
+    ) -> tuple[set[tuple], set[tuple], dict[tuple, str]]:
         """Return existing-row state for the date range.
 
         Returns ``(existing_keys, empty_text_keys, empty_text_ids)`` where:
@@ -695,7 +696,7 @@ class SupabaseClient:
         rows = resp.json() or []
         existing_keys: set[tuple] = set()
         empty_text_keys: set[tuple] = set()
-        empty_text_ids: dict[tuple, int] = {}
+        empty_text_ids: dict[tuple, str] = {}
         for r in rows:
             key = self._stable_key_from_row(r)
             existing_keys.add(key)
@@ -750,7 +751,7 @@ class SupabaseClient:
                     break
         return out
 
-    def bump_detail_attempts(self, ids: list[int]) -> None:
+    def bump_detail_attempts(self, ids: list[str]) -> None:
         """Increment ``detail_fetch_attempts`` and stamp ``last_detail_attempt_at``
         for every row we attempted a detail-fetch on this run, regardless of
         outcome. This is a direct UPDATE (not the fill-only RPC, which would not
