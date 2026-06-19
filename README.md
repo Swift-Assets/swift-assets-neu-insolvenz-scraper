@@ -63,6 +63,7 @@ GET  /ap/text.xhtml    (النص الكامل)
 ### 2. متغيرات GitHub Actions Secrets
 - `SUPABASE_URL` — رابط مشروع Supabase
 - `SUPABASE_SERVICE_ROLE_KEY` — مفتاح service role
+- `SWIFT_ASSETS_GH_PAT` — GitHub Personal Access Token يُستخدم لإرسال `repository_dispatch` عبر المستودعات لتشغيل سير عمل إثراء Handelsregister بعد نجاح السحب والـ backfill. الصلاحية المطلوبة: classic PAT مع نطاق `repo`، أو fine-grained PAT مع صلاحية `Contents: Read & Write` مُخصّصة لتشمل مستودع `swift-assets-handelsregister-scraper`. إذا لم يُضبط هذا السر، يستمر السحب اليومي بالنجاح لكن يُتخطّى إرسال الـ dispatch الخاص بالإثراء.
 
 ### 3. الجدولة
 يعمل تلقائياً يومياً الساعة `22:05 UTC` = `00:05 برلين` (بعد منتصف الليل).
