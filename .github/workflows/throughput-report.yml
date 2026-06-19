@@ -1,0 +1,49 @@
+name: Daily Throughput Report
+
+# Daily performance/capacity tracking report.
+# Runs at 06:00 UTC = 08:00 Europe/Berlin (CEST). Deliberately clear of the
+# scrape windows (insolvency 18:00 & 00:05 Berlin; HR enrichment ~18:05-22:05
+# and ~00:10-04:10 Berlin) so it never overlaps an active ingestion run.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: throughput-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install matplotlib
+
+      - name: Generate throughput report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OUTPUT_DIR: reports
+        run: python scripts/throughput_report.py
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-report-${{ github.run_id }}
+          path: reports/
+          retention-days: 90
+          if-no-files-found: error
