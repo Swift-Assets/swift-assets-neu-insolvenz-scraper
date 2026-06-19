@@ -1,10 +1,11 @@
 name: Daily Insolvency Scrape
 
-# يعمل يومياً الساعة 00:05 بتوقيت برلين (22:05 UTC في الصيف، 23:05 UTC في الشتاء)
-# نستخدم 22:05 UTC لتغطية حالة التوقيت الصيفي (CEST)
+# Runs daily at 18:00 Europe/Berlin.
+# GitHub Actions cron is UTC-only (no DST). 16:00 UTC = 18:00 CEST (summer, current) / 19:00 CET (winter).
+# يعمل يومياً الساعة 18:00 بتوقيت برلين (16:00 UTC في الصيف CEST، يصبح 19:00 برلين في الشتاء CET).
 on:
   schedule:
-    - cron: "5 22 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       date_from:
