@@ -21,10 +21,18 @@ Environment variables:
     SUPABASE_SERVICE_ROLE_KEY   — required (unless DRY_RUN=1)
     SCRAPE_DATE_FROM            — YYYY-MM-DD (default: today)
     SCRAPE_DATE_TO              — YYYY-MM-DD (default: today)
-    MAX_DETAIL_FETCHES          — int (default: 1500)
+    MAX_DETAIL_FETCHES          — int (default: 1500). Half is reserved for new
+                                  rows so backfill cannot starve them.
+    MAX_DETAIL_ATTEMPTS         — int (default: 3). An empty-text row drops out
+                                  of the backfill set after this many fetch
+                                  attempts (tracked in detail_fetch_attempts).
     DETAIL_WORKERS              — int (default: 4)
     DRY_RUN                     — "1" to skip DB writes
     SKIP_DETAILS                — "1" to only upsert listing-level data
+    WRITE_PHASE_FIELDS          — default ON: write insolvency_phase /
+                                  is_pre_verteilung columns (they exist on
+                                  apify_cases). Set to "0" to disable; fields
+                                  are still computed and shown in DRY_RUN.
 """
 
 from __future__ import annotations
@@ -64,7 +72,14 @@ REQUEST_TIMEOUT_SEC = 30
 MAX_RETRIES = 3
 DEFAULT_DETAIL_WORKERS = 4
 DEFAULT_MAX_DETAIL_FETCHES = 1500
+DEFAULT_MAX_DETAIL_ATTEMPTS = 3   # give up re-fetching an empty row after N tries
 DETAIL_FETCH_DELAY_SEC = 0.2   # per worker
+
+# Write the computed phase columns (insolvency_phase, is_pre_verteilung) to the
+# DB. The columns exist on public.apify_cases and the fill-only RPC accepts
+# them, so the safe default is ON. Set WRITE_PHASE_FIELDS=0 to disable (the
+# fields are still computed and shown in DRY_RUN output).
+WRITE_PHASE_FIELDS = os.getenv("WRITE_PHASE_FIELDS", "1") != "0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +91,17 @@ log = logging.getLogger("neu_insolvenz")
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
+
+def _norm_key_val(v: Any) -> Any:
+    """Normalize a unique-key field so the scraper side and the DB side compare
+    equal. A DB value stored as ``''`` or with stray surrounding whitespace must
+    match a scraper-side ``None`` / trimmed value. Non-strings (already-ISO
+    dates are plain strings, so this only ever sees strings or None) pass through
+    unchanged."""
+    if isinstance(v, str):
+        return v.strip() or None
+    return v
+
 
 @dataclass
 class InsolvencyRecord:
@@ -96,6 +122,8 @@ class InsolvencyRecord:
     opening_date: str | None = None
     claims_deadline: str | None = None
     announcement_type_hint: str | None = None
+    insolvency_phase: str | None = None        # see classify_phase()
+    is_pre_verteilung: bool | None = None       # True = potentially acquirable
     scraped_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -103,13 +131,31 @@ class InsolvencyRecord:
     # transient — not stored in DB, used internally
     _row_index: int = field(default=-1, repr=False)
     _button_id: str | None = field(default=None, repr=False)
+    # DB primary key (apify_cases.id is a UUID/text), only set for existing rows
+    # we backfill (so we can bump detail_fetch_attempts by id afterwards). None
+    # for brand-new listing rows.
+    _db_id: str | None = field(default=None, repr=False)
 
     def unique_key(self) -> tuple:
-        """Match the DB unique constraint."""
-        return (
-            self.court, self.case_number, self.announcement_date,
-            self.announcement_type_hint,
-            self.registry_court, self.registry_type, self.registry_number,
+        """Stable identity used for dedup and re-fetch matching.
+
+        Intentionally EXCLUDES ``announcement_type_hint``: that field is NULL
+        at listing time and only gets a value after detail-fetch/classification,
+        so including it made the same announcement hash differently before vs
+        after enrichment, breaking dedup and re-fetch matching. The fields below
+        are all known at listing time and mirror the DB RPC's stable-match logic
+        (``neu_insolvenz_fill_only_upsert`` matches on exactly these and treats
+        ``announcement_type_hint`` as a fill-only/guarded column).
+
+        Each field is passed through ``_norm_key_val`` so a DB value stored as
+        ``''`` or with stray whitespace matches the scraper-side ``None``/trimmed
+        value — see ``SupabaseClient._stable_key_from_row`` which applies the
+        same normalization."""
+        return tuple(
+            _norm_key_val(v) for v in (
+                self.court, self.case_number, self.announcement_date,
+                self.registry_court, self.registry_type, self.registry_number,
+            )
         )
 
     def to_db_dict(self) -> dict[str, Any]:
@@ -117,6 +163,21 @@ class InsolvencyRecord:
         # Drop internal fields
         d.pop("_row_index", None)
         d.pop("_button_id", None)
+        d.pop("_db_id", None)
+        # The phase fields are always computed (and used in dry-run output) and
+        # sent to the DB by default (the columns exist on public.apify_cases and
+        # the fill-only RPC accepts them). is_pre_verteilung is kept as a native
+        # bool here so the JSON payload carries a true boolean (the RPC checks
+        # jsonb_typeof = 'boolean'). Set WRITE_PHASE_FIELDS=0 to omit them.
+        if not WRITE_PHASE_FIELDS:
+            d.pop("insolvency_phase", None)
+            d.pop("is_pre_verteilung", None)
+        # Never send the "unknown" placeholder: an unknown/ambiguous phase is
+        # the same as "not classified", so emit it as None (dropped below) so it
+        # can never overwrite or block a later real classification. (The RPC also
+        # guards this, but we keep the scraper honest too.)
+        elif d.get("insolvency_phase") == PHASE_UNKNOWN:
+            d["insolvency_phase"] = None
         # Keep nullable fields part of the unique constraint even if None
         keep_null = {
             "announcement_date", "case_number", "court",
@@ -216,6 +277,93 @@ def detect_announcement_type(text: str) -> str | None:
     return None
 
 
+# ----- Insolvency phase classification --------------------------------------
+#
+# Determines the lifecycle phase of a case from the FULL announcement text and
+# whether the company is still PRE-VERTEILUNG (pre-distribution = potentially
+# acquirable). Returns phase enum values the downstream swift_v2 layer already
+# consumes; when genuinely ambiguous we keep "unknown" rather than guessing.
+
+PHASE_UNKNOWN = "unknown"
+
+
+def _normalize_de(text: str) -> str:
+    """Lower-case and fold umlaut/ß + whitespace variants so keyword matching
+    is tolerant of how the portal spells things (ä/ae, ö/oe, ü/ue, ß/ss)."""
+    t = text.lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t)
+
+
+# Late-stage / "dead" signals — case is winding down or closed, NOT acquirable.
+# (label is matched against the umlaut-folded, whitespace-normalized text)
+LATE_STAGE_SIGNALS: list[tuple[str, str]] = [
+    ("schlusstermin", "schlusstermin"),
+    ("schlussverteilung", "schlussverteilung"),
+    ("verteilungsverzeichnis", "verteilungsverzeichnis"),
+    ("aufhebung des insolvenzverfahrens", "aufhebung"),
+    ("einstellung mangels masse", "dismissed_lack_of_assets"),
+    ("abweisung mangels masse", "dismissed_lack_of_assets"),
+    ("masseunzulaenglichkeit", "masseunzulaenglichkeit"),
+    ("restschuldbefreiung", "restschuldbefreiung"),
+]
+
+# Pre-distribution / still-open signals — case is opening or under
+# administration, company is potentially acquirable. Ordered most-specific
+# first so e.g. preliminary administration wins over a bare "eroeffnung".
+PRE_VERTEILUNG_SIGNALS: list[tuple[str, str]] = [
+    ("vorlaeufige insolvenzverwaltung", "preliminary_administration"),
+    ("vorlaeufiger insolvenzverwalter", "preliminary_administration"),
+    ("vorlaeufige insolvenzverwalterin", "preliminary_administration"),
+    ("anordnung der vorlaeufigen", "preliminary_administration"),
+    ("sicherungsmassnahmen", "preliminary_administration"),
+    ("sicherungsmassnahme", "preliminary_administration"),
+    ("eroeffnung des insolvenzverfahrens", "opening"),
+    ("insolvenzverfahren eroeffnet", "opening"),
+    ("insolvenzverwalter bestellt", "administrator_appointed"),
+    ("insolvenzverwalterin bestellt", "administrator_appointed"),
+    ("bestellung des insolvenzverwalters", "administrator_appointed"),
+    ("bestellung der insolvenzverwalterin", "administrator_appointed"),
+    ("zum insolvenzverwalter", "administrator_appointed"),
+    ("zur insolvenzverwalterin", "administrator_appointed"),
+]
+
+
+def classify_phase(text: str | None) -> tuple[str, bool | None]:
+    """Classify the insolvency phase from the full announcement text.
+
+    Returns ``(phase, is_pre_verteilung)``:
+      - ``phase``            : one of the enum values above, or ``"unknown"``.
+      - ``is_pre_verteilung``: True when an opening/preliminary/administrator
+        signal is present AND no late-stage signal is present; False when any
+        late-stage signal is present; None when the phase is unknown.
+
+    Late-stage signals take precedence: an announcement can mention both the
+    original opening and a closing event, but the presence of any closing
+    signal means the company is no longer acquirable."""
+    if not text or not text.strip():
+        return PHASE_UNKNOWN, None
+
+    norm = _normalize_de(text)
+
+    late_phase: str | None = None
+    for needle, label in LATE_STAGE_SIGNALS:
+        if needle in norm:
+            late_phase = label
+            break
+
+    if late_phase is not None:
+        # Any late-stage signal => not acquirable, regardless of opening text.
+        return late_phase, False
+
+    for needle, label in PRE_VERTEILUNG_SIGNALS:
+        if needle in norm:
+            return label, True
+
+    return PHASE_UNKNOWN, None
+
+
 # ----- Field extraction from full text --------------------------------------
 
 OPENING_PATTERNS = [
@@ -249,12 +397,15 @@ ADMIN_PATTERNS = [
 ]
 
 
-def extract_fields_from_text(text: str) -> dict[str, str | None]:
-    out: dict[str, str | None] = {
+def extract_fields_from_text(text: str) -> dict[str, Any]:
+    phase, is_pre = classify_phase(text)
+    out: dict[str, Any] = {
         "insolvency_administrator": None,
         "opening_date": None,
         "claims_deadline": None,
         "announcement_type_hint": detect_announcement_type(text),
+        "insolvency_phase": phase,
+        "is_pre_verteilung": is_pre,
     }
     if not text:
         return out
@@ -496,32 +647,155 @@ class SupabaseClient:
             "Authorization": f"Bearer {service_key}",
         }
 
-    def get_existing_keys(self, date_from: date, date_to: date) -> set[tuple]:
-        """Return the set of unique-keys already present in the DB for the date range."""
-        endpoint = f"{self.url}/rest/v1/apify_cases"
-        params = {
-            "select": "court,case_number,announcement_date,announcement_type_hint,registry_court,registry_type,registry_number",
-            "announcement_date": f"gte.{date_from.isoformat()}",
-        }
-        # combine with lte using a second param
-        resp = requests.get(
-            endpoint, params=params,
-            headers={**self.base_headers, "Range-Unit": "items"},
-            timeout=60,
+    @staticmethod
+    def _stable_key_from_row(r: dict) -> tuple:
+        """Build the stable identity tuple from a DB row, matching
+        InsolvencyRecord.unique_key() (announcement_type_hint excluded).
+
+        Applies the same ``_norm_key_val`` normalization as unique_key() so a
+        value stored as ``''`` or with stray whitespace matches a scraper-side
+        ``None``/trimmed value."""
+        return tuple(
+            _norm_key_val(v) for v in (
+                r.get("court"), r.get("case_number"), r.get("announcement_date"),
+                r.get("registry_court"), r.get("registry_type"),
+                r.get("registry_number"),
+            )
         )
-        # second filter via additional query
-        endpoint2 = f"{self.url}/rest/v1/apify_cases?select={params['select']}&announcement_date=gte.{date_from.isoformat()}&announcement_date=lte.{date_to.isoformat()}"
-        resp = requests.get(endpoint2, headers=self.base_headers, timeout=60)
+
+    def get_existing_keys(
+        self, date_from: date, date_to: date, max_attempts: int
+    ) -> tuple[set[tuple], set[tuple], dict[tuple, str]]:
+        """Return existing-row state for the date range.
+
+        Returns ``(existing_keys, empty_text_keys, empty_text_ids)`` where:
+          - ``existing_keys``   : stable keys already present in the DB.
+          - ``empty_text_keys`` : subset of those whose ``announcement_text`` is
+            NULL/empty AND ``detail_fetch_attempts < max_attempts`` — i.e. rows
+            still worth a detail-fetch. Rows that have already been attempted
+            ``max_attempts`` times (server keeps returning empty) are excluded so
+            they cannot livelock the backfill set.
+          - ``empty_text_ids``  : ``key -> db id`` for the empty_text_keys, so the
+            caller can bump ``detail_fetch_attempts`` by id after fetching.
+
+        The key tuple mirrors InsolvencyRecord.unique_key() exactly so that
+        ``record.unique_key() in existing_keys`` matches reliably."""
+        select = (
+            "id,court,case_number,announcement_date,registry_court,"
+            "registry_type,registry_number,announcement_text,detail_fetch_attempts"
+        )
+        endpoint = (
+            f"{self.url}/rest/v1/apify_cases?select={select}"
+            f"&announcement_date=gte.{date_from.isoformat()}"
+            f"&announcement_date=lte.{date_to.isoformat()}"
+        )
+        resp = requests.get(endpoint, headers=self.base_headers, timeout=60)
         if resp.status_code >= 400:
             log.warning("Failed to fetch existing keys: %d %s", resp.status_code, resp.text[:200])
-            return set()
+            return set(), set(), {}
         rows = resp.json() or []
-        return {
-            (r.get("court"), r.get("case_number"), r.get("announcement_date"),
-             r.get("announcement_type_hint"), r.get("registry_court"),
-             r.get("registry_type"), r.get("registry_number"))
-            for r in rows
-        }
+        existing_keys: set[tuple] = set()
+        empty_text_keys: set[tuple] = set()
+        empty_text_ids: dict[tuple, str] = {}
+        for r in rows:
+            key = self._stable_key_from_row(r)
+            existing_keys.add(key)
+            text = r.get("announcement_text")
+            attempts = r.get("detail_fetch_attempts") or 0
+            if (text is None or not str(text).strip()) and attempts < max_attempts:
+                empty_text_keys.add(key)
+                if r.get("id") is not None:
+                    empty_text_ids[key] = r["id"]
+        return existing_keys, empty_text_keys, empty_text_ids
+
+    def fetch_empty_text_backlog(
+        self, max_attempts: int, limit: int
+    ) -> list[dict]:
+        """Directly select empty-text rows from the DB, independent of the
+        current listing/scrape window (BUG 1: rows outside today's window were
+        otherwise unreachable). Oldest-first so the longest-waiting rows drain
+        first, capped at ``limit`` (the reserved backfill budget).
+
+        Returns the raw DB rows (dicts) including ``id`` and the identity fields
+        needed to re-locate the row in a fresh listing search. We filter
+        empty-text in Python (PostgREST cannot express ``trim(text) = ''`` as a
+        simple operator) but push the cheap predicates (attempts cap, ordering,
+        a generous row limit) to the server."""
+        if limit <= 0:
+            return []
+        select = (
+            "id,court,case_number,announcement_date,registry_court,"
+            "registry_type,registry_number,announcement_text,detail_fetch_attempts"
+        )
+        # Over-fetch a little because the ''-vs-NULL distinction is applied
+        # client-side; NULL text is the common case and is server-filterable.
+        server_limit = max(limit * 4, limit + 50)
+        endpoint = (
+            f"{self.url}/rest/v1/apify_cases?select={select}"
+            f"&detail_fetch_attempts=lt.{max_attempts}"
+            f"&order=announcement_date.asc"
+            f"&limit={server_limit}"
+        )
+        resp = requests.get(endpoint, headers=self.base_headers, timeout=60)
+        if resp.status_code >= 400:
+            log.warning("Failed to fetch empty-text backlog: %d %s",
+                        resp.status_code, resp.text[:200])
+            return []
+        rows = resp.json() or []
+        out: list[dict] = []
+        for r in rows:
+            text = r.get("announcement_text")
+            if text is None or not str(text).strip():
+                out.append(r)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def bump_detail_attempts(self, ids: list[str]) -> None:
+        """Increment ``detail_fetch_attempts`` and stamp ``last_detail_attempt_at``
+        for every row we attempted a detail-fetch on this run, regardless of
+        outcome. This is a direct UPDATE (not the fill-only RPC, which would not
+        increment) so that rows which keep returning empty text eventually cross
+        ``MAX_DETAIL_ATTEMPTS`` and drop out of the backfill candidate set.
+
+        PostgREST has no atomic ``col = col + 1`` expression, so we read the
+        current values for the touched ids and write back ``value + 1`` in a
+        single bulk upsert (merge-duplicates) keyed by id."""
+        if not ids:
+            return
+        unique_ids = sorted(set(ids))
+        id_csv = ",".join(str(i) for i in unique_ids)
+        read_ep = (
+            f"{self.url}/rest/v1/apify_cases"
+            f"?select=id,detail_fetch_attempts&id=in.({id_csv})"
+        )
+        try:
+            resp = requests.get(read_ep, headers=self.base_headers, timeout=60)
+            if resp.status_code >= 400:
+                log.warning("bump_detail_attempts read failed: %d %s",
+                            resp.status_code, resp.text[:200])
+                return
+            current = {row["id"]: (row.get("detail_fetch_attempts") or 0)
+                       for row in (resp.json() or [])}
+            now_iso = datetime.now(timezone.utc).isoformat()
+            payload = [
+                {"id": i,
+                 "detail_fetch_attempts": current.get(i, 0) + 1,
+                 "last_detail_attempt_at": now_iso}
+                for i in unique_ids
+            ]
+            write_ep = f"{self.url}/rest/v1/apify_cases?on_conflict=id"
+            headers = {
+                **self.base_headers,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            }
+            wresp = requests.post(write_ep, json=payload, headers=headers, timeout=60)
+            if wresp.status_code >= 400:
+                log.warning("bump_detail_attempts write failed: %d %s",
+                            wresp.status_code, wresp.text[:200])
+        except requests.RequestException as e:
+            log.warning("bump_detail_attempts request error: %s", e)
 
     # PostgreSQL duplicate-key SQLSTATE returned by PostgREST as JSON "code".
     # Treated as a *non-fatal* conflict at chunk level: we retry the chunk
@@ -715,13 +989,66 @@ class SupabaseClient:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def recover_backlog_records(backlog_rows: list[dict]) -> list[InsolvencyRecord]:
+    """Turn DB backlog rows (from ``fetch_empty_text_backlog``) into fetchable
+    ``InsolvencyRecord`` objects, independent of the current scrape window.
+
+    A detail-fetch needs the session-specific ``_row_index``/``_button_id``,
+    which only exist after a listing search. So we search ONCE per distinct
+    ``announcement_date`` present in the backlog, match each returned listing row
+    to its DB row by the stable ``unique_key()``, and copy over the recovered
+    row index/button id plus the DB ``id`` (so attempts can be bumped later).
+
+    Rows whose date can no longer be searched, or that no longer appear in the
+    portal's results, are skipped (they will simply remain in the backlog until
+    they age past MAX_DETAIL_ATTEMPTS once attempted, or stay unreachable — a
+    limitation documented in the README)."""
+    if not backlog_rows:
+        return []
+
+    # Map stable key -> db row, and collect distinct dates to search.
+    by_key: dict[tuple, dict] = {}
+    dates: set[date] = set()
+    for r in backlog_rows:
+        key = SupabaseClient._stable_key_from_row(r)
+        by_key[key] = r
+        ad = r.get("announcement_date")
+        if ad:
+            try:
+                dates.add(date.fromisoformat(str(ad)[:10]))
+            except ValueError:
+                continue
+
+    recovered: list[InsolvencyRecord] = []
+    for d in sorted(dates):  # oldest-first
+        try:
+            s = NeuInsolvenzScraper()
+            s.initialize_session()
+            day_listing = s.search(d, d)
+        except Exception as e:  # noqa: BLE001 — one bad day must not abort backfill
+            log.warning("Backlog recovery search failed for %s: %s", d, e)
+            continue
+        for rec in day_listing:
+            row = by_key.get(rec.unique_key())
+            if row is None:
+                continue
+            rec._db_id = row.get("id")
+            recovered.append(rec)
+    log.info("Backlog recovery: matched %d / %d empty-text rows via date searches",
+             len(recovered), len(backlog_rows))
+    return recovered
+
+
 def fetch_details_with_pool(
     listing: list[InsolvencyRecord],
     workers: int,
 ) -> int:
     """For each record in `listing`, fetch its full text and enrich the record.
     Uses `workers` parallel JSF sessions (each session serializes its own
-    detail fetches because of the server-side last-clicked-row state)."""
+    detail fetches because of the server-side last-clicked-row state).
+
+    Mutates each record in place (announcement_text + extracted fields). Returns
+    the number of records whose detail-fetch *succeeded* (text was retrieved)."""
     if not listing or workers < 1:
         return 0
 
@@ -765,6 +1092,8 @@ def fetch_details_with_pool(
                 rec.opening_date = fields["opening_date"]
                 rec.claims_deadline = fields["claims_deadline"]
                 rec.announcement_type_hint = fields["announcement_type_hint"]
+                rec.insolvency_phase = fields["insolvency_phase"]
+                rec.is_pre_verteilung = fields["is_pre_verteilung"]
                 done += 1
                 with done_lock:
                     nonlocal total_done
@@ -790,6 +1119,7 @@ def main() -> int:
     dry_run = os.getenv("DRY_RUN") == "1"
     skip_details = os.getenv("SKIP_DETAILS") == "1"
     max_details = int(os.getenv("MAX_DETAIL_FETCHES", str(DEFAULT_MAX_DETAIL_FETCHES)))
+    max_attempts = int(os.getenv("MAX_DETAIL_ATTEMPTS", str(DEFAULT_MAX_DETAIL_ATTEMPTS)))
     workers = int(os.getenv("DETAIL_WORKERS", str(DEFAULT_DETAIL_WORKERS)))
 
     if not dry_run and (not supabase_url or not supabase_key):
@@ -818,25 +1148,81 @@ def main() -> int:
         log.warning("No results in range. Done.")
         return 0
 
-    # Phase 2: detail fetching — skip records already in DB
+    # Phase 2: detail fetching.
+    # We detail-fetch three groups, in priority order:
+    #   (a) backfill_records — existing DB rows with empty/NULL announcement_text
+    #       and detail_fetch_attempts < MAX_DETAIL_ATTEMPTS. These come from BOTH
+    #       the current listing window AND a direct-by-id DB query (so rows
+    #       outside today's scrape window are still reachable — BUG 1). Oldest
+    #       first, so the longest-waiting rows drain first.
+    #   (b) new_records      — rows not yet in the DB.
+    # The backfill group can never take more than half of MAX_DETAIL_FETCHES, so
+    # a large/stuck backlog can never fully starve brand-new rows. Every detail
+    # attempt on an existing row bumps detail_fetch_attempts so rows that keep
+    # returning empty text drop out of the candidate set after the cap.
     new_records: list[InsolvencyRecord] = listing
+    backfill_records: list[InsolvencyRecord] = []
+    client: SupabaseClient | None = None
     if not dry_run and supabase_url and supabase_key:
         client = SupabaseClient(supabase_url, supabase_key, run_id)
-        existing_keys = client.get_existing_keys(date_from, date_to)
-        log.info("Existing DB keys in range: %d", len(existing_keys))
+        existing_keys, empty_text_keys, empty_text_ids = client.get_existing_keys(
+            date_from, date_to, max_attempts)
+        log.info("Existing DB keys in range: %d (of which empty announcement_text & retryable: %d)",
+                 len(existing_keys), len(empty_text_keys))
         new_records = [r for r in listing if r.unique_key() not in existing_keys]
+        # In-window backfill: listing rows whose DB row is empty + retryable.
+        # Tag them with their DB id so we can bump attempts afterwards.
+        backfill_records = []
+        seen_backfill: set[tuple] = set()
+        for r in listing:
+            k = r.unique_key()
+            if k in empty_text_keys:
+                r._db_id = empty_text_ids.get(k)
+                backfill_records.append(r)
+                seen_backfill.add(k)
         log.info("New (not-yet-in-DB) records: %d / %d total listing rows",
                  len(new_records), len(listing))
+        log.info("In-window rows needing announcement_text backfill: %d", len(backfill_records))
+
+        # Direct-by-id backlog: empty-text rows from anywhere in the DB (not just
+        # today's window), oldest-first, capped at the reserved backfill budget.
+        backfill_budget = max(1, max_details // 2)
+        backlog_rows = client.fetch_empty_text_backlog(max_attempts, backfill_budget)
+        if backlog_rows:
+            recovered = recover_backlog_records(backlog_rows)
+            for rec in recovered:
+                if rec.unique_key() not in seen_backfill:
+                    backfill_records.append(rec)
+                    seen_backfill.add(rec.unique_key())
+            log.info("Out-of-window backlog rows added for backfill: %d", len(recovered))
     else:
         log.info("Dry run — skipping DB key check.")
+
+    # Records that came from the direct-by-id backlog are NOT part of `listing`,
+    # so they must be persisted explicitly in Phase 3.
+    extra_persist: list[InsolvencyRecord] = [
+        r for r in backfill_records if r not in listing
+    ]
 
     if skip_details:
         log.info("SKIP_DETAILS=1 — not fetching announcement_text.")
     else:
-        to_fetch = new_records[:max_details]
-        if len(new_records) > max_details:
-            log.warning("Capped detail fetches at %d (had %d new records).",
-                        max_details, len(new_records))
+        # Oldest-first within each group so the longest-waiting rows drain first
+        # (aligns with the README). Reserve at least half of MAX_DETAIL_FETCHES
+        # for NEW rows so backfill can never 100% starve them.
+        def _by_date_asc(recs: list[InsolvencyRecord]) -> list[InsolvencyRecord]:
+            return sorted(recs, key=lambda r: r.announcement_date or "")
+
+        backfill_budget = max(1, max_details // 2)
+        backfill_part = _by_date_asc(backfill_records)[:backfill_budget]
+        ordered = backfill_part + _by_date_asc(new_records)
+        to_fetch = ordered[:max_details]
+        if len(ordered) > max_details:
+            log.warning(
+                "Capped detail fetches at %d (had %d to fetch: %d backfill (budget %d) + %d new). "
+                "Remaining backlog will be picked up on the next run.",
+                max_details, len(ordered), len(backfill_records), backfill_budget,
+                len(new_records))
         if to_fetch:
             log.info("Fetching details for %d records with %d workers...",
                      len(to_fetch), workers)
@@ -846,6 +1232,18 @@ def main() -> int:
             log.info("Detail fetches done: %d/%d in %.1fs (%.2fs avg)",
                      fetched, len(to_fetch), elapsed, elapsed / max(1, fetched))
 
+        # Bump detail_fetch_attempts for every EXISTING row we attempted this run
+        # (success or empty), so rows that keep coming back empty eventually
+        # cross MAX_DETAIL_ATTEMPTS and stop re-entering the backfill set.
+        if client is not None:
+            attempted_ids = [
+                r._db_id for r in to_fetch if r._db_id is not None
+            ]
+            if attempted_ids:
+                client.bump_detail_attempts(attempted_ids)
+                log.info("Bumped detail_fetch_attempts for %d existing rows.",
+                         len(attempted_ids))
+
     # Phase 3: persist
     if dry_run:
         log.info("DRY_RUN=1 — printing sample record and exiting.")
@@ -854,11 +1252,17 @@ def main() -> int:
             for k, v in sample.to_db_dict().items():
                 preview = (str(v)[:140] + "...") if v and len(str(v)) > 140 else v
                 log.info("  %s = %r", k, preview)
+            # Always surface the computed phase classification in dry-run, even
+            # when WRITE_PHASE_FIELDS is off (so they are excluded from to_db_dict).
+            log.info("  insolvency_phase = %r", sample.insolvency_phase)
+            log.info("  is_pre_verteilung = %r", sample.is_pre_verteilung)
         return 0
 
-    client = SupabaseClient(supabase_url, supabase_key, run_id)
-    # Upsert all listing rows (fill-only on existing thanks to RPC).
-    stats = client.upsert_cases(listing)
+    if client is None:
+        client = SupabaseClient(supabase_url, supabase_key, run_id)
+    # Upsert all listing rows plus any out-of-window backlog rows we backfilled
+    # (fill-only on existing thanks to the RPC).
+    stats = client.upsert_cases(listing + extra_persist)
 
     inserted = stats["inserted_total"]
     updated = stats["updated_total"]

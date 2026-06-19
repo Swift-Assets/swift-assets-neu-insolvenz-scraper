@@ -39,7 +39,14 @@ GET  /ap/text.xhtml    (النص الكامل)
 - تاريخ الافتتاح (`opening_date`)
 - موعد تقديم المطالبات (`claims_deadline`)
 - نوع الإعلان (`announcement_type_hint`: Eröffnung / Aufhebung / etc.)
+- مرحلة الإفلاس (`insolvency_phase`) وعلامة قابلية الاستحواذ (`is_pre_verteilung`) — تُستخرَج من النص الكامل وتُكتَب افتراضياً في قاعدة البيانات (العمودان موجودان في `apify_cases`؛ الـ RPC يكتبهما fill-only)
 - المحكمة والسجل التجاري (HRA/HRB/PR/VR + رقم)
+
+#### تصنيف المرحلة (`insolvency_phase` / `is_pre_verteilung`)
+يُحلَّل النص الكامل للإعلان:
+- **قبل التوزيع (قابل للاستحواذ، `is_pre_verteilung = true`):** Eröffnung des Insolvenzverfahrens، vorläufige Insolvenzverwaltung، Bestellung des Insolvenzverwalters، Sicherungsmaßnahmen → القيم: `opening` / `preliminary_administration` / `administrator_appointed`
+- **مرحلة متأخرة (غير قابل للاستحواذ، `is_pre_verteilung = false`):** Schlusstermin، Schlussverteilung، Verteilungsverzeichnis، Aufhebung، Einstellung/Abweisung mangels Masse (`dismissed_lack_of_assets`)، Masseunzulänglichkeit (`masseunzulaenglichkeit`)، Restschuldbefreiung
+- المطابقة غير حساسة لحالة الأحرف وتتسامح مع تنويعات الـ Umlaut والمسافات؛ وعند الغموض تبقى القيمة `unknown`.
 
 ### الكتابة في Supabase
 يستخدم RPC مخصص `neu_insolvenz_fill_only_upsert` يضمن:
@@ -49,11 +56,21 @@ GET  /ap/text.xhtml    (النص الكامل)
 - **تحديث `updated_at`** على كل تعديل
 
 ### مفتاح التفرّد (Unique Key)
-يعتمد على القيد الموجود في `apify_cases`:
+مفتاح الهوية المستقر المستخدَم في الـ dedup وإعادة الجلب يعتمد على الحقول المعروفة وقت سحب القائمة فقط (يستثني `announcement_type_hint` لأنه فارغ وقت القائمة ويُملأ لاحقاً)، ويطابق منطق الـ RPC `neu_insolvenz_fill_only_upsert`:
 ```
-(court, case_number, announcement_date, announcement_type_hint,
+(court, case_number, announcement_date,
  registry_court, registry_type, registry_number)
 ```
+`announcement_type_hint` يُعامَل كحقل تعبئة فقط (fill-only) داخل الـ RPC، لا كجزء من المفتاح.
+
+### إعادة جلب النص للسجلات الفارغة (Backfill)
+بالإضافة إلى السجلات الجديدة، يُعيد السكرابر جلب النص الكامل للسجلات الموجودة مسبقاً التي يكون `announcement_text` فيها فارغاً/NULL:
+
+- **مسار مباشر بالمعرّف (id) مستقل عن نافذة السحب:** يُحدِّد السكرابر السجلات الفارغة مباشرةً من قاعدة البيانات (وليس فقط ضمن نطاق تاريخ السحب الحالي)، **الأقدم أولاً**، ثم يستعيد فهرس الصف عبر بحث ليوم كل سجل لإعادة جلب نصّه. هكذا تصبح السجلات القديمة الواقعة خارج نافذة السحب اليومية قابلة للمعالجة (إصلاح BUG 1).
+- **علامة المحاولات (attempt marker):** يحمل العمودان `detail_fetch_attempts` و`last_detail_attempt_at` (موجودان على `apify_cases`) عدد المحاولات. تُزاد المحاولة عند كل محاولة جلب لصفّ موجود (بنجاح أو بنص فارغ). يخرج الصفّ من مجموعة الـ backfill بعد `MAX_DETAIL_ATTEMPTS` محاولة (افتراضياً 3)، فلا تعلق الصفوف التي يُرجِع الخادم لها نصاً فارغاً في حلقة لا نهائية.
+- **ميزانية محجوزة للسجلات الجديدة:** لا يأخذ الـ backfill أكثر من نصف `MAX_DETAIL_FETCHES`، فلا يمكن أن يُجوِّع السجلات الجديدة بالكامل. الإجمالي محدود بـ `MAX_DETAIL_FETCHES` (1500/تشغيل) بحيث يتوزّع أي تراكم على عدة أيام.
+
+> ملاحظة: استعادة فهرس الصف تتطلب أن يظل اليوم قابلاً للبحث وأن يظهر السجل في نتائج البوابة؛ السجلات التي لم تَعُد تظهر تبقى في التراكم حتى تتجاوز `MAX_DETAIL_ATTEMPTS` بعد محاولتها.
 
 ## الإعداد الأولي (تم بالفعل)
 
@@ -102,10 +119,12 @@ python scraper.py
 | `SUPABASE_SERVICE_ROLE_KEY` | — | **مطلوب** (إلا في DRY_RUN) |
 | `SCRAPE_DATE_FROM` | اليوم | تاريخ البداية YYYY-MM-DD |
 | `SCRAPE_DATE_TO` | اليوم | تاريخ النهاية YYYY-MM-DD |
-| `MAX_DETAIL_FETCHES` | 1500 | حد أقصى لجلب التفاصيل في كل تشغيل |
+| `MAX_DETAIL_FETCHES` | 1500 | حد أقصى لجلب التفاصيل في كل تشغيل (يُحجَز نصفه للسجلات الجديدة) |
+| `MAX_DETAIL_ATTEMPTS` | 3 | عدد محاولات إعادة الجلب لصفّ فارغ قبل إخراجه من الـ backfill (يعتمد على `detail_fetch_attempts`) |
 | `DETAIL_WORKERS` | 4 | عدد العمّال المتوازيين |
 | `DRY_RUN` | — | `1` للاختبار بدون كتابة |
 | `SKIP_DETAILS` | — | `1` لتخطّي مرحلة التفاصيل |
+| `WRITE_PHASE_FIELDS` | `1` (مُفعّل) | كتابة عمودَي `insolvency_phase` و`is_pre_verteilung` (موجودان الآن في `apify_cases`). الافتراضي مُفعّل؛ اضبطه على `0` لتعطيله (يبقى الحقلان محسوبَين ويظهران في DRY_RUN) |
 
 ## الأداء المتوقع
 
