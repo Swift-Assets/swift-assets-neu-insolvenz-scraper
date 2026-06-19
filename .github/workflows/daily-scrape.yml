@@ -113,6 +113,7 @@ jobs:
 
       - name: Notify on failure
         if: failure()
+        continue-on-error: true
         uses: actions/github-script@v8
         with:
           script: |

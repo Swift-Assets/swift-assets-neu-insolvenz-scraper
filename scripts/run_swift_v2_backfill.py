@@ -3,8 +3,9 @@
 run_swift_v2_backfill.py
 ========================
 
-Calls the Supabase RPC ``swift_v2.backfill_neu_insolvenz_direct_entities(null)``
-after a successful scraper run.
+Drains the Swift V2 entity backfill backlog by calling the Supabase RPC
+``swift_v2.backfill_neu_insolvenz_direct_entities(p_limit)`` in a **bounded,
+batched loop** after a successful scraper run.
 
 This is *Option 1* (temporary): the scraper keeps writing to
 ``public.apify_cases``; this script then copies / links the newly arrived
@@ -12,10 +13,30 @@ This is *Option 1* (temporary): the scraper keeps writing to
 architecture (``swift_v2.source_neu_insolvenz_announcements``,
 ``swift_v2.portal_entities``, ``swift_v2.entity_source_links``).
 
+Why bounded batches
+-------------------
+The RPC used to be called with ``p_limit = NULL`` (process the entire backlog
+in a single transaction). Once volume grew (~7.6k rows) that single unbounded
+call exceeded PostgREST's ~8s statement timeout (Postgres ``57014: canceling
+statement due to statement timeout``).
+
+The DB function is now **forward-progressing**: it only selects ``apify_cases``
+rows that still need work (not yet ingested, OR ``entity_id`` is null, OR
+missing their ``entity_source_links`` row), ordered ``created_at ASC`` and
+bounded by ``p_limit``. So repeated bounded calls drain the backlog and, when
+nothing needs work, the function returns ``source_rows_changed = 0``. This
+makes a bounded batched loop both safe (each call stays well under the timeout)
+and guaranteed to terminate.
+
 Environment
 -----------
 - ``SUPABASE_URL``                — required, e.g. ``https://<project>.supabase.co``
 - ``SUPABASE_SERVICE_ROLE_KEY``   — required, service role JWT
+- ``BACKFILL_BATCH_SIZE``         — optional, positive int (default 1000).
+                                    Passed as ``p_limit`` on each RPC call.
+- ``BACKFILL_MAX_BATCHES``        — optional, positive int (default 100).
+                                    Hard safety cap on the number of iterations
+                                    so the script ALWAYS terminates.
 
 Secrets handling
 ----------------
@@ -42,8 +63,8 @@ not include ``swift_v2`` under ``db-schemas``, the call will return HTTP 404
 
 Exit code
 ---------
-- ``0``  → RPC succeeded (HTTP 2xx)
-- ``2``  → configuration error (missing env vars / bad URL)
+- ``0``  → backlog drained, or the safety cap was hit cleanly (HTTP 2xx throughout)
+- ``2``  → configuration error (missing env vars / bad URL / bad batch config)
 - ``3``  → HTTP request transport error (timeouts, DNS, etc.)
 - ``4``  → RPC returned non-2xx HTTP status
 """
@@ -58,7 +79,18 @@ from urllib import error, request
 
 RPC_NAME = "backfill_neu_insolvenz_direct_entities"
 SCHEMA = "swift_v2"
-TIMEOUT_SECONDS = 600  # backfill of ~4k rows is fast, but allow headroom
+TIMEOUT_SECONDS = 600  # each call is now bounded; allow ample headroom
+
+DEFAULT_BATCH_SIZE = 1000
+DEFAULT_MAX_BATCHES = 100
+
+RESULT_FIELDS = (
+    "source_rows_changed",
+    "source_rows_total",
+    "entities_total",
+    "source_rows_linked",
+    "links_total",
+)
 
 
 def _fail(code: int, msg: str) -> None:
@@ -75,23 +107,23 @@ def _redact(s: str) -> str:
     return s
 
 
-def main() -> None:
-    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
-    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        _fail(2, f"{name} must be a positive integer, got {raw!r}")
+    if value <= 0:
+        _fail(2, f"{name} must be a positive integer, got {value}")
+    return value
 
-    if not supabase_url:
-        _fail(2, "SUPABASE_URL is not set")
-    if not service_key:
-        _fail(2, "SUPABASE_SERVICE_ROLE_KEY is not set")
-    if not supabase_url.startswith("https://"):
-        _fail(2, "SUPABASE_URL must start with https://")
 
-    endpoint = f"{supabase_url}/rest/v1/rpc/{RPC_NAME}"
-    print(f"[run_swift_v2_backfill] Calling RPC: {SCHEMA}.{RPC_NAME}(null)")
-    print(f"[run_swift_v2_backfill] Endpoint:   {endpoint}")
-    print(f"[run_swift_v2_backfill] Profile:    {SCHEMA}")
-
-    body = json.dumps({"p_limit": None}).encode("utf-8")
+def _call_rpc(endpoint: str, service_key: str, p_limit: int) -> tuple[int, str]:
+    """Make a single bounded RPC call. On HTTP/transport error this exits the
+    process (preserving exit codes 3/4) so a real DB problem fails the run."""
+    body = json.dumps({"p_limit": p_limit}).encode("utf-8")
 
     req = request.Request(
         endpoint,
@@ -118,70 +150,132 @@ def main() -> None:
             err_body = e.read().decode("utf-8", errors="replace")[:1000]
         except Exception:  # noqa: BLE001
             pass
-        _fail(
-            4,
-            f"RPC returned HTTP {e.code}: {_redact(err_body) or e.reason}",
-        )
-        return  # for type checkers
+        _fail(4, f"RPC returned HTTP {e.code}: {_redact(err_body) or e.reason}")
+        raise  # unreachable; for type checkers
     except error.URLError as e:
         _fail(3, f"HTTP transport error: {_redact(str(e.reason))}")
-        return
+        raise
     except Exception as e:  # noqa: BLE001
         _fail(3, f"Unexpected error: {_redact(type(e).__name__)}")
-        return
+        raise
 
     if not (200 <= status < 300):
         _fail(4, f"RPC returned non-2xx HTTP {status}: {_redact(raw[:500])}")
 
-    # ---- Parse and summarize ----
+    return status, raw
+
+
+def _parse_row(status: int, raw: str) -> dict[str, Any]:
+    """Parse the single-row RPC result. The RPC returns TABLE(...) → PostgREST
+    wraps it as a list with one dict."""
     try:
         parsed: Any = json.loads(raw)
     except json.JSONDecodeError:
         print(f"[run_swift_v2_backfill] HTTP {status}, non-JSON response "
               f"(first 200 chars): {raw[:200]!r}")
-        print("[run_swift_v2_backfill] Treating as success (HTTP 2xx).")
-        sys.exit(0)
+        return {}
 
-    # The RPC returns TABLE(...) → PostgREST wraps it as a list of dicts.
-    row: dict[str, Any] = {}
     if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-        row = parsed[0]
-    elif isinstance(parsed, dict):
-        row = parsed
+        return parsed[0]
+    if isinstance(parsed, dict):
+        return parsed
+    return {}
 
-    print("[run_swift_v2_backfill] ✅ Backfill RPC succeeded")
-    print("[run_swift_v2_backfill] Result summary:")
-    for field in (
-        "source_rows_changed",
-        "source_rows_total",
-        "entities_total",
-        "source_rows_linked",
-        "links_total",
-    ):
-        if field in row:
-            print(f"  - {field:25s}: {row[field]}")
-        else:
-            print(f"  - {field:25s}: <not returned>")
 
-    # Append to GitHub Actions step summary if available
+def _write_step_summary(batches_run: int, capped: bool, row: dict[str, Any]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary_path:
-        try:
-            with open(summary_path, "a", encoding="utf-8") as f:
-                f.write("\n### Swift V2 backfill result\n\n")
-                f.write(f"`{SCHEMA}.{RPC_NAME}(null)` → HTTP {status}\n\n")
-                f.write("| Metric | Value |\n|---|---|\n")
-                for field in (
-                    "source_rows_changed",
-                    "source_rows_total",
-                    "entities_total",
-                    "source_rows_linked",
-                    "links_total",
-                ):
-                    f.write(f"| `{field}` | {row.get(field, 'n/a')} |\n")
-        except OSError:
-            # Summary file is optional; never let it break the job
-            pass
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("\n### Swift V2 backfill result\n\n")
+            f.write(f"`{SCHEMA}.{RPC_NAME}(p_limit)` drained over "
+                    f"{batches_run} batch(es)")
+            if capped:
+                f.write(" — **safety cap reached, backlog may remain**")
+            f.write("\n\n")
+            f.write("| Metric | Value |\n|---|---|\n")
+            for field in RESULT_FIELDS:
+                f.write(f"| `{field}` | {row.get(field, 'n/a')} |\n")
+    except OSError:
+        # Summary file is optional; never let it break the job
+        pass
+
+
+def main() -> None:
+    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+    if not supabase_url:
+        _fail(2, "SUPABASE_URL is not set")
+    if not service_key:
+        _fail(2, "SUPABASE_SERVICE_ROLE_KEY is not set")
+    if not supabase_url.startswith("https://"):
+        _fail(2, "SUPABASE_URL must start with https://")
+
+    batch_size = _positive_int_env("BACKFILL_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+    max_batches = _positive_int_env("BACKFILL_MAX_BATCHES", DEFAULT_MAX_BATCHES)
+
+    endpoint = f"{supabase_url}/rest/v1/rpc/{RPC_NAME}"
+    print(f"[run_swift_v2_backfill] Calling RPC: {SCHEMA}.{RPC_NAME}(p_limit)")
+    print(f"[run_swift_v2_backfill] Endpoint:   {endpoint}")
+    print(f"[run_swift_v2_backfill] Profile:    {SCHEMA}")
+    print(f"[run_swift_v2_backfill] Batch size: {batch_size}")
+    print(f"[run_swift_v2_backfill] Max batches: {max_batches}")
+
+    last_row: dict[str, Any] = {}
+    batches_run = 0
+    capped = False
+
+    while True:
+        if batches_run >= max_batches:
+            capped = True
+            print(f"[run_swift_v2_backfill] WARNING: reached "
+                  f"BACKFILL_MAX_BATCHES={max_batches} safety cap. Backlog may "
+                  f"remain; the next scheduled run will continue draining it. "
+                  f"Stopping without error.")
+            break
+
+        batch_no = batches_run + 1
+        status, raw = _call_rpc(endpoint, service_key, batch_size)
+        row = _parse_row(status, raw)
+        last_row = row
+        batches_run = batch_no
+
+        changed = row.get("source_rows_changed")
+        print(f"[run_swift_v2_backfill] Batch {batch_no} (HTTP {status}):")
+        for field in RESULT_FIELDS:
+            value = row[field] if field in row else "<not returned>"
+            print(f"  - {field:25s}: {value}")
+
+        # Forward-progressing function: it only selects rows that NEED work.
+        # 0 changed  → backlog fully drained.
+        # < batch    → fewer than a full batch remained → backlog now drained.
+        # == batch   → a full batch processed → more may remain → continue.
+        if not isinstance(changed, int):
+            # Defensive: if the count is missing/non-int we cannot reason about
+            # progress, so stop rather than risk looping.
+            print("[run_swift_v2_backfill] source_rows_changed missing or "
+                  "non-integer; stopping after this batch.")
+            break
+        if changed == 0:
+            print("[run_swift_v2_backfill] Backlog fully drained "
+                  "(source_rows_changed == 0).")
+            break
+        if changed < batch_size:
+            print(f"[run_swift_v2_backfill] Partial batch "
+                  f"({changed} < {batch_size}); backlog drained.")
+            break
+        # changed == batch_size → continue to next iteration.
+
+    print("[run_swift_v2_backfill] ✅ Backfill RPC loop complete "
+          f"({batches_run} batch(es) run).")
+    print("[run_swift_v2_backfill] Final result summary:")
+    for field in RESULT_FIELDS:
+        value = last_row[field] if field in last_row else "<not returned>"
+        print(f"  - {field:25s}: {value}")
+
+    _write_step_summary(batches_run, capped, last_row)
 
     sys.exit(0)
 
