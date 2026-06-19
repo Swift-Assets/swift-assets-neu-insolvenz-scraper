@@ -1066,50 +1066,92 @@ def fetch_details_with_pool(
         # IMPORTANT: each worker needs its own session AND must run its own
         # search to populate that session's results state (because the
         # row-index → record mapping is session-specific).
+        #
+        # The row index (`rec._row_index`) is parsed positionally from
+        # `tbl_ergebnis:<N>:` ids within a SINGLE search result page (see
+        # _parse_results). It is only valid for the exact (single-day) search
+        # that produced it. A worker chunk can mix records from several distinct
+        # announcement dates (backlog/out-of-window rows get round-robined across
+        # workers), so we must NEVER search a multi-day range here: a wide range
+        # both invalidates the positional indices AND can trip the source's
+        # "zu viele Treffer" guard (>1000 rows), which raises in search().
+        #
+        # So: group work by announcement_date and run one SINGLE-DAY search per
+        # date (date_from == date_to), then fetch only that day's records before
+        # moving on — mirroring the main per-day listing loop that produced the
+        # indices in the first place.
         worker = NeuInsolvenzScraper()
         worker.initialize_session()
-        # Re-search so this session's tbl_ergebnis matches the row indices
-        date_from = date.fromisoformat(work_items[0].announcement_date) if work_items[0].announcement_date else date.today()
-        # We need the FULL date range. Pass via attribute set by caller.
-        # See main(): we store on the records.
-        date_to = date_from
+
+        # Group this chunk's records by their announcement date. Records with a
+        # missing/empty date can't be re-searched safely (no day to scope to);
+        # bucket them under today's date as a best-effort single-day search
+        # rather than ever widening into a range.
+        by_date: dict[date, list[InsolvencyRecord]] = {}
         for it in work_items:
             if it.announcement_date:
-                d = date.fromisoformat(it.announcement_date)
-                if d < date_from:
-                    date_from = d
-                if d > date_to:
-                    date_to = d
-        worker.search(date_from, date_to)
+                try:
+                    d = date.fromisoformat(it.announcement_date)
+                except ValueError:
+                    log.warning(
+                        "Worker %d: unparseable announcement_date %r (az=%s) — "
+                        "using today() for single-day re-search",
+                        worker_id, it.announcement_date, it.case_number)
+                    d = date.today()
+            else:
+                log.warning(
+                    "Worker %d: record has no announcement_date (az=%s) — "
+                    "using today() for single-day re-search",
+                    worker_id, it.case_number)
+                d = date.today()
+            by_date.setdefault(d, []).append(it)
 
         done = 0
-        for rec in work_items:
+        for d in sorted(by_date):
+            day_items = by_date[d]
+            # Isolate each date: a transient error or an unexpected "zu viele
+            # Treffer" for one day must NOT abort the other dates or the run.
             try:
-                text = worker.fetch_detail_text(rec._row_index, rec._button_id)
-                rec.announcement_text = text
-                fields = extract_fields_from_text(text)
-                rec.insolvency_administrator = fields["insolvency_administrator"]
-                rec.opening_date = fields["opening_date"]
-                rec.claims_deadline = fields["claims_deadline"]
-                rec.announcement_type_hint = fields["announcement_type_hint"]
-                rec.insolvency_phase = fields["insolvency_phase"]
-                rec.is_pre_verteilung = fields["is_pre_verteilung"]
-                done += 1
-                with done_lock:
-                    nonlocal total_done
-                    total_done += 1
-                    if total_done % 50 == 0:
-                        log.info("Detail progress: %d/%d", total_done, len(listing))
-                time.sleep(DETAIL_FETCH_DELAY_SEC)
-            except Exception as e:
-                log.warning("Detail fetch failed (worker=%d, row=%d, az=%s): %s",
-                            worker_id, rec._row_index, rec.case_number, e)
+                worker.search(d, d)  # single-day range only — never a span
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "Worker %d: re-search for %s failed (%d records skipped): %s",
+                    worker_id, d, len(day_items), e)
+                continue
+
+            for rec in day_items:
+                try:
+                    text = worker.fetch_detail_text(rec._row_index, rec._button_id)
+                    rec.announcement_text = text
+                    fields = extract_fields_from_text(text)
+                    rec.insolvency_administrator = fields["insolvency_administrator"]
+                    rec.opening_date = fields["opening_date"]
+                    rec.claims_deadline = fields["claims_deadline"]
+                    rec.announcement_type_hint = fields["announcement_type_hint"]
+                    rec.insolvency_phase = fields["insolvency_phase"]
+                    rec.is_pre_verteilung = fields["is_pre_verteilung"]
+                    done += 1
+                    with done_lock:
+                        nonlocal total_done
+                        total_done += 1
+                        if total_done % 50 == 0:
+                            log.info("Detail progress: %d/%d", total_done, len(listing))
+                    time.sleep(DETAIL_FETCH_DELAY_SEC)
+                except Exception as e:
+                    log.warning("Detail fetch failed (worker=%d, date=%s, row=%d, az=%s): %s",
+                                worker_id, d, rec._row_index, rec.case_number, e)
         return done
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(run_worker, i, chunk) for i, chunk in enumerate(chunks)]
         for f in as_completed(futures):
-            f.result()
+            # A worker should already isolate its own per-date/per-record
+            # failures, but never let an unexpected exception from one worker
+            # abort the whole run — log it and keep collecting the rest.
+            try:
+                f.result()
+            except Exception as e:  # noqa: BLE001
+                log.warning("A detail-fetch worker raised and was isolated: %s", e)
     return total_done
 
 
