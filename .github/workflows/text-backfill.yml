@@ -1,0 +1,97 @@
+name: Historical Text Backfill
+
+# Phase 4 — Dedicated workflow to drain announcement_text backlog for entities
+# already in the swift_v2 portal. The daily scrape covers ~5k new announcements
+# per day; this workflow runs every 6 hours to chip away at older empty-text
+# rows without competing with new-row processing in the daily run.
+#
+# Strategy:
+#   - SCRAPE_DATE_FROM/TO empty by default → defaults to TODAY only at the
+#     scraper level, but we set them empty here intentionally to fetch a
+#     listing for "today" so the session is initialized; the real work is
+#     fetch_empty_text_backlog() which is window-INDEPENDENT.
+#   - High MAX_DETAIL_FETCHES (8000) since this is detail-only work.
+#   - SKIP_DETAILS=0 (we want details, that's the whole point).
+#   - 6 workers — same polite cap as daily run; the portal rate limits per IP.
+#
+# يعمل كل 6 ساعات لإفراغ تراكم announcement_text للسجلات القديمة، بدون منافسة
+# السجلات الجديدة في الـ daily run.
+
+on:
+  schedule:
+    # 02:00, 08:00, 14:00, 20:00 UTC daily (every 6 hours)
+    - cron: "0 2,8,14,20 * * *"
+  workflow_dispatch:
+    inputs:
+      max_details:
+        description: "الحد الأقصى لجلب التفاصيل في هذا الـ run"
+        required: false
+        default: "8000"
+      max_attempts:
+        description: "الحد الأقصى لمحاولات إعادة الجلب قبل التخلي عن الصف"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  backfill_text:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    concurrency:
+      group: text-backfill
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper in backlog-drain mode
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Empty scrape window → today only; the heavy lifting is the
+          # window-independent backlog drain inside the scraper.
+          SCRAPE_DATE_FROM: ""
+          SCRAPE_DATE_TO: ""
+          MAX_DETAIL_FETCHES: ${{ github.event.inputs.max_details || '8000' }}
+          MAX_DETAIL_ATTEMPTS: ${{ github.event.inputs.max_attempts || '5' }}
+          DETAIL_WORKERS: "6"
+        run: |
+          python scraper.py
+
+      - name: Notify on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const title = `❌ فشل سكرابر التراكم - ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              `## فشل التشغيل الدوري لإفراغ تراكم announcement_text`,
+              ``,
+              `- **التاريخ:** ${new Date().toISOString()}`,
+              `- **الـ Run:** [#${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              `- **Workflow:** ${context.workflow}`,
+              ``,
+              `راجع اللوغ لمعرفة السبب. لا يؤثر على الـ daily scrape.`,
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['scraper-failure', 'automated', 'backfill']
+            });
