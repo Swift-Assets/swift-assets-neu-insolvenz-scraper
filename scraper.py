@@ -732,21 +732,32 @@ class SupabaseClient:
             "id,court,case_number,announcement_date,registry_court,"
             "registry_type,registry_number,announcement_text,detail_fetch_attempts"
         )
-        # Over-fetch a little because the ''-vs-NULL distinction is applied
-        # client-side; NULL text is the common case and is server-filterable.
-        server_limit = max(limit * 4, limit + 50)
+        # Server-side filter for NULL text (the dominant case, >99.9% per Phase 4
+        # audit on 2026-06-20). Empty-string text is rare; we still apply the
+        # client-side trim guard for safety.
+        # Use PostgREST Range header to override the default 1000-row server cap
+        # (PostgREST's max-rows config defaults to 1000 even when ?limit= is set;
+        # see https://postgrest.org/en/stable/references/api/pagination_count.html ).
+        server_limit = max(limit * 2, limit + 50)
         endpoint = (
             f"{self.url}/rest/v1/apify_cases?select={select}"
             f"&detail_fetch_attempts=lt.{max_attempts}"
+            f"&announcement_text=is.null"
             f"&order=announcement_date.asc"
             f"&limit={server_limit}"
         )
-        resp = requests.get(endpoint, headers=self.base_headers, timeout=60)
-        if resp.status_code >= 400:
+        headers = dict(self.base_headers)
+        # Range-Unit + Range escape the PostgREST default 1000-row ceiling.
+        headers["Range-Unit"] = "items"
+        headers["Range"] = f"0-{server_limit - 1}"
+        resp = requests.get(endpoint, headers=headers, timeout=120)
+        if resp.status_code >= 400 and resp.status_code != 206:
             log.warning("Failed to fetch empty-text backlog: %d %s",
                         resp.status_code, resp.text[:200])
             return []
         rows = resp.json() or []
+        log.info("fetch_empty_text_backlog: server returned %d candidate rows (server_limit=%d)",
+                 len(rows), server_limit)
         out: list[dict] = []
         for r in rows:
             text = r.get("announcement_text")
