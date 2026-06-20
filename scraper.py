@@ -21,12 +21,12 @@ Environment variables:
     SUPABASE_SERVICE_ROLE_KEY   — required (unless DRY_RUN=1)
     SCRAPE_DATE_FROM            — YYYY-MM-DD (default: today)
     SCRAPE_DATE_TO              — YYYY-MM-DD (default: today)
-    MAX_DETAIL_FETCHES          — int (default: 1500). Half is reserved for new
+    MAX_DETAIL_FETCHES          — int (default: 5000). Half is reserved for new
                                   rows so backfill cannot starve them.
-    MAX_DETAIL_ATTEMPTS         — int (default: 3). An empty-text row drops out
+    MAX_DETAIL_ATTEMPTS         — int (default: 5). An empty-text row drops out
                                   of the backfill set after this many fetch
                                   attempts (tracked in detail_fetch_attempts).
-    DETAIL_WORKERS              — int (default: 4)
+    DETAIL_WORKERS              — int (default: 6)
     DRY_RUN                     — "1" to skip DB writes
     SKIP_DETAILS                — "1" to only upsert listing-level data
     WRITE_PHASE_FIELDS          — default ON: write insolvency_phase /
@@ -71,9 +71,13 @@ USER_AGENT = (
 
 REQUEST_TIMEOUT_SEC = 30
 MAX_RETRIES = 3
-DEFAULT_DETAIL_WORKERS = 4
-DEFAULT_MAX_DETAIL_FETCHES = 1500
-DEFAULT_MAX_DETAIL_ATTEMPTS = 3   # give up re-fetching an empty row after N tries
+DEFAULT_DETAIL_WORKERS = 6
+DEFAULT_MAX_DETAIL_FETCHES = 5000
+DEFAULT_MAX_DETAIL_ATTEMPTS = 5   # give up re-fetching an empty row after N tries
+# Phase 4 (2026-06-20): bumped from 4/1500/3 to 6/5000/5. The daily portal
+# volume is ~3k-5k new announcements; the old budget could only fetch ~1/3 of
+# them, leaving ~3k empty-text rows per day that the swift_v2 enrichment queue
+# could not classify by phase. New budget covers a full day plus drains backlog.
 DETAIL_FETCH_DELAY_SEC = 0.2   # per worker
 
 # Write the computed phase columns (insolvency_phase, is_pre_verteilung) to the

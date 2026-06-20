@@ -23,7 +23,7 @@ on:
       max_details:
         description: "حد أقصى لجلب التفاصيل"
         required: false
-        default: "1500"
+        default: "5000"
 
 permissions:
   contents: read
@@ -32,7 +32,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     concurrency:
       group: daily-scrape
       cancel-in-progress: false
@@ -58,8 +58,8 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SCRAPE_DATE_FROM: ${{ github.event.inputs.date_from }}
           SCRAPE_DATE_TO: ${{ github.event.inputs.date_to }}
-          MAX_DETAIL_FETCHES: ${{ github.event.inputs.max_details || '1500' }}
-          DETAIL_WORKERS: "4"
+          MAX_DETAIL_FETCHES: ${{ github.event.inputs.max_details || '5000' }}
+          DETAIL_WORKERS: "6"
         run: |
           python scraper.py
 
