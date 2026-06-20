@@ -49,6 +49,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timezone
 from threading import Lock
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -751,51 +752,175 @@ class SupabaseClient:
                     break
         return out
 
-    def bump_detail_attempts(self, ids: list[str]) -> None:
-        """Increment ``detail_fetch_attempts`` and stamp ``last_detail_attempt_at``
-        for every row we attempted a detail-fetch on this run, regardless of
-        outcome. This is a direct UPDATE (not the fill-only RPC, which would not
-        increment) so that rows which keep returning empty text eventually cross
-        ``MAX_DETAIL_ATTEMPTS`` and drop out of the backfill candidate set.
+    def resolve_ids_by_key(
+        self, records: list["InsolvencyRecord"]
+    ) -> dict[tuple, str]:
+        """Resolve the DB ``id`` for each attempted record by its stable
+        ``unique_key()``, independent of whether ``_db_id`` was ever populated.
 
-        PostgREST has no atomic ``col = col + 1`` expression, so we read the
-        current values for the touched ids and write back ``value + 1`` in a
-        single bulk upsert (merge-duplicates) keyed by id."""
+        This is the linchpin of reliable attempt-tracking: the old by-id bump
+        only fired for rows whose ``_db_id`` happened to be set (in-window empty
+        rows and recovered backlog rows), so brand-new rows — and any row whose
+        ``empty_text_ids`` lookup missed — were never counted. Here we re-query
+        the DB over the exact announcement_date(s) we attempted and match each
+        returned row to an attempted record via the SAME normalized stable key
+        used everywhere else (``_stable_key_from_row`` mirrors ``unique_key``).
+        Because this runs AFTER the upsert, even rows that were brand-new this
+        run now exist and resolve to a real id.
+
+        Returns a ``{stable_key_tuple -> db id}`` map."""
+        if not records:
+            return {}
+        # Collect the distinct dates we need to scan. A missing/empty date is
+        # rare for existing rows but we guard it: such rows simply won't resolve
+        # (and are logged by the caller's read-back mismatch warning).
+        dates: set[date] = set()
+        for r in records:
+            ad = r.announcement_date
+            if ad:
+                try:
+                    dates.add(date.fromisoformat(str(ad)[:10]))
+                except ValueError:
+                    continue
+        wanted: set[tuple] = {r.unique_key() for r in records}
+        key_to_id: dict[tuple, str] = {}
+        select = (
+            "id,court,case_number,announcement_date,registry_court,"
+            "registry_type,registry_number"
+        )
+        for d in sorted(dates):
+            endpoint = (
+                f"{self.url}/rest/v1/apify_cases?select={select}"
+                f"&announcement_date=eq.{d.isoformat()}"
+            )
+            try:
+                resp = requests.get(endpoint, headers=self.base_headers, timeout=60)
+            except requests.RequestException as e:
+                log.warning("resolve_ids_by_key request error for %s: %s", d, e)
+                continue
+            if resp.status_code >= 400:
+                log.warning("resolve_ids_by_key read failed for %s: %d %s",
+                            d, resp.status_code, resp.text[:200])
+                continue
+            for row in (resp.json() or []):
+                key = self._stable_key_from_row(row)
+                if key in wanted and row.get("id") is not None:
+                    key_to_id[key] = row["id"]
+        return key_to_id
+
+    def bump_detail_attempts_for_records(
+        self, records: list["InsolvencyRecord"]
+    ) -> int:
+        """Increment ``detail_fetch_attempts`` (+1) and stamp
+        ``last_detail_attempt_at`` for every record we attempted a detail-fetch
+        on this run — success OR empty result — keyed by the row's stable
+        ``unique_key()`` rather than a pre-resolved ``_db_id``.
+
+        This is the fix for the production bug where ALL rows kept
+        ``detail_fetch_attempts = 0``: the previous by-id path (a) only ran for
+        rows with ``_db_id`` set, and (b) wrote via a partial-row upsert
+        (``on_conflict=id`` + ``merge-duplicates``) that PostgREST evaluates as an
+        INSERT-first statement — the partial payload omits NOT-NULL columns, so
+        the write silently failed and was swallowed as a warning. Here we instead
+        resolve real ids by key (after the upsert, so every attempted row exists)
+        and issue a real PATCH per id, then READ BACK to verify the count.
+
+        Returns the number of rows actually updated (read-back count), so a future
+        silent failure is visible in the logs."""
+        if not records:
+            return 0
+        key_to_id = self.resolve_ids_by_key(records)
+        ids = sorted(set(key_to_id.values()))
+        attempted = len({r.unique_key() for r in records})
         if not ids:
-            return
+            log.warning(
+                "bump_detail_attempts: resolved 0 ids for %d attempted rows — "
+                "attempt-tracking did NOT persist (check key normalization).",
+                attempted)
+            return 0
+        updated = self._patch_attempts_by_id(ids)
+        if updated != len(ids):
+            log.warning(
+                "bump_detail_attempts: expected to update %d rows but DB "
+                "read-back shows %d updated this run (attempted=%d, resolved=%d).",
+                len(ids), updated, attempted, len(ids))
+        else:
+            log.info(
+                "bump_detail_attempts: persisted +1 attempt for %d/%d rows "
+                "(verified by read-back).", updated, attempted)
+        return updated
+
+    def _patch_attempts_by_id(self, ids: list[str]) -> int:
+        """Real per-id PATCH (NOT an upsert): read current attempts, write
+        ``value + 1`` and a fresh ``last_detail_attempt_at`` via HTTP PATCH with
+        an ``id=eq.<id>`` filter, then read back and count how many rows now carry
+        this run's timestamp. PostgREST has no atomic ``col = col + 1``, so the
+        read-then-write is per-id; ids are UUIDs stored as text and a single-id
+        ``eq`` filter sidesteps any ``in.()`` quoting ambiguity.
+
+        Returns the verified count of rows updated with this run's timestamp."""
+        if not ids:
+            return 0
         unique_ids = sorted(set(ids))
         id_csv = ",".join(str(i) for i in unique_ids)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # 1) Read current attempt counts for all touched ids in one request.
         read_ep = (
             f"{self.url}/rest/v1/apify_cases"
             f"?select=id,detail_fetch_attempts&id=in.({id_csv})"
         )
         try:
             resp = requests.get(read_ep, headers=self.base_headers, timeout=60)
-            if resp.status_code >= 400:
-                log.warning("bump_detail_attempts read failed: %d %s",
-                            resp.status_code, resp.text[:200])
-                return
-            current = {row["id"]: (row.get("detail_fetch_attempts") or 0)
-                       for row in (resp.json() or [])}
-            now_iso = datetime.now(timezone.utc).isoformat()
-            payload = [
-                {"id": i,
-                 "detail_fetch_attempts": current.get(i, 0) + 1,
-                 "last_detail_attempt_at": now_iso}
-                for i in unique_ids
-            ]
-            write_ep = f"{self.url}/rest/v1/apify_cases?on_conflict=id"
-            headers = {
-                **self.base_headers,
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            }
-            wresp = requests.post(write_ep, json=payload, headers=headers, timeout=60)
-            if wresp.status_code >= 400:
-                log.warning("bump_detail_attempts write failed: %d %s",
-                            wresp.status_code, wresp.text[:200])
         except requests.RequestException as e:
-            log.warning("bump_detail_attempts request error: %s", e)
+            log.warning("bump_detail_attempts read error: %s", e)
+            return 0
+        if resp.status_code >= 400:
+            log.warning("bump_detail_attempts read failed: %d %s",
+                        resp.status_code, resp.text[:200])
+            return 0
+        current = {row["id"]: (row.get("detail_fetch_attempts") or 0)
+                   for row in (resp.json() or [])}
+        # 2) PATCH each id with value+1 and the run timestamp. A real PATCH only
+        #    UPDATEs existing rows (no INSERT branch, so no NOT-NULL surprise).
+        patch_headers = {
+            **self.base_headers,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        for i in unique_ids:
+            body = {
+                "detail_fetch_attempts": current.get(i, 0) + 1,
+                "last_detail_attempt_at": now_iso,
+            }
+            patch_ep = f"{self.url}/rest/v1/apify_cases?id=eq.{i}"
+            try:
+                presp = requests.patch(
+                    patch_ep, json=body, headers=patch_headers, timeout=60)
+                if presp.status_code >= 400:
+                    log.warning("bump_detail_attempts PATCH failed for %s: %d %s",
+                                i, presp.status_code, presp.text[:200])
+            except requests.RequestException as e:
+                log.warning("bump_detail_attempts PATCH error for %s: %s", i, e)
+        # 3) Read back: count rows whose last_detail_attempt_at == this run's
+        #    timestamp, proving the write actually landed. The ISO timestamp
+        #    contains a literal '+' ('+00:00') which a URL query parser decodes as
+        #    a space, so it MUST be percent-encoded or the filter silently matches
+        #    nothing (and the verify would wrongly report 0).
+        verify_ep = (
+            f"{self.url}/rest/v1/apify_cases"
+            f"?select=id&id=in.({id_csv})"
+            f"&last_detail_attempt_at=eq.{quote(now_iso, safe='')}"
+        )
+        try:
+            vresp = requests.get(verify_ep, headers=self.base_headers, timeout=60)
+            if vresp.status_code >= 400:
+                log.warning("bump_detail_attempts verify read failed: %d %s",
+                            vresp.status_code, vresp.text[:200])
+                return 0
+            return len(vresp.json() or [])
+        except requests.RequestException as e:
+            log.warning("bump_detail_attempts verify error: %s", e)
+            return 0
 
     # PostgreSQL duplicate-key SQLSTATE returned by PostgREST as JSON "code".
     # Treated as a *non-fatal* conflict at chunk level: we retry the chunk
@@ -1213,13 +1338,13 @@ def main() -> int:
                  len(existing_keys), len(empty_text_keys))
         new_records = [r for r in listing if r.unique_key() not in existing_keys]
         # In-window backfill: listing rows whose DB row is empty + retryable.
-        # Tag them with their DB id so we can bump attempts afterwards.
+        # (Attempt-tracking is now resolved by unique_key() after the upsert via
+        # bump_detail_attempts_for_records, so we no longer depend on _db_id.)
         backfill_records = []
         seen_backfill: set[tuple] = set()
         for r in listing:
             k = r.unique_key()
             if k in empty_text_keys:
-                r._db_id = empty_text_ids.get(k)
                 backfill_records.append(r)
                 seen_backfill.add(k)
         log.info("New (not-yet-in-DB) records: %d / %d total listing rows",
@@ -1246,6 +1371,10 @@ def main() -> int:
         r for r in backfill_records if r not in listing
     ]
 
+    # Records we actually attempt a detail-fetch on this run (any group). Their
+    # detail_fetch_attempts must be incremented by exactly 1 AFTER the upsert
+    # (so brand-new rows already exist and resolve to a real id).
+    to_fetch: list[InsolvencyRecord] = []
     if skip_details:
         log.info("SKIP_DETAILS=1 — not fetching announcement_text.")
     else:
@@ -1274,18 +1403,6 @@ def main() -> int:
             log.info("Detail fetches done: %d/%d in %.1fs (%.2fs avg)",
                      fetched, len(to_fetch), elapsed, elapsed / max(1, fetched))
 
-        # Bump detail_fetch_attempts for every EXISTING row we attempted this run
-        # (success or empty), so rows that keep coming back empty eventually
-        # cross MAX_DETAIL_ATTEMPTS and stop re-entering the backfill set.
-        if client is not None:
-            attempted_ids = [
-                r._db_id for r in to_fetch if r._db_id is not None
-            ]
-            if attempted_ids:
-                client.bump_detail_attempts(attempted_ids)
-                log.info("Bumped detail_fetch_attempts for %d existing rows.",
-                         len(attempted_ids))
-
     # Phase 3: persist
     if dry_run:
         log.info("DRY_RUN=1 — printing sample record and exiting.")
@@ -1305,6 +1422,15 @@ def main() -> int:
     # Upsert all listing rows plus any out-of-window backlog rows we backfilled
     # (fill-only on existing thanks to the RPC).
     stats = client.upsert_cases(listing + extra_persist)
+
+    # Persist detail_fetch_attempts for every row we attempted this run — keyed
+    # by the row's stable unique_key(), NOT by _db_id. Must run AFTER the upsert
+    # so brand-new rows already exist in the DB and resolve to a real id. Rows
+    # NOT attempted this run are left untouched. This is what makes the
+    # MAX_DETAIL_ATTEMPTS cap actually engage: empty-at-source rows accumulate
+    # attempts and eventually drop out of the backfill candidate set.
+    if to_fetch:
+        client.bump_detail_attempts_for_records(to_fetch)
 
     inserted = stats["inserted_total"]
     updated = stats["updated_total"]
