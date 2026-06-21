@@ -402,10 +402,131 @@ ADMIN_PATTERNS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Insolvenzverwalter (administrator) extraction
+# ---------------------------------------------------------------------------
+# Kept in PARITY with the DB function swift_v2.fn_parse_insolvency_admin so the
+# apify-side name and the portal-side structured columns agree. Handles the two
+# dominant German phrasings (and Sachwalter/Treuhänder):
+#   A) "... Insolvenzverwalter ist: Rechtsanwalt <Name>, <Firm?>, <Street>,
+#       <PLZ City>, Tel.: <phone>, E-Mail: <email>."   (comma-delimited)
+#   B) "Zum Insolvenzverwalter wird bestellt: <Name> <Street>, <PLZ City>
+#       Telefon: <phone> Email: <email>"               (name glued to street)
+# Anchors the office address on the 5-digit PLZ and only parses the
+# administrator block (stops at "Die Gläubiger ..." / "§"). Unparseable fields
+# are left None — never guessed. Guards against capturing the debtor or
+# boilerplate: a parsed name must be titled OR backed by a real contact block.
+_ADMIN_STREET_RE = (
+    r"(?:[A-ZÄÖÜ][A-Za-zäöüß.\-]*(?:[Ss]tra(?:ß|ss)e|[Ss]tr\.|[Aa]llee|[Ww]eg|[Pp]latz|[Rr]ing|[Gg]asse|[Dd]amm|[Uu]fer|[Ww]all|[Cc]haussee|[Ll]andstr\.?)"
+    r"|[A-ZÄÖÜ][A-Za-zäöüß.\-]+ (?:Stra(?:ß|ss)e|Str\.|Allee|Weg|Platz|Ring|Gasse|Damm|Ufer|Wall|Chaussee))\.? \d+ ?[a-z]?"
+)
+_ADMIN_STOP_RE = r"(?: Die (?:Insolvenz)?[Gg]läubiger| Insolvenzforderungen sind| Forderungen sind| §| \d\.? Die)"
+_ADMIN_TRIGGER = re.compile(
+    r"(?:zum |zur |zu )?(?:vorl[äa]ufige[rn]? )?"
+    r"(?:Insolvenzverwalter(?:in)?|Sachwalter(?:in)?|Treuh[äa]nder(?:in)?) "
+    r"(?:(?:ist|wird|hiermit|bestellt|bestimmt|ernannt|worden|zum|zur)[\s:]+){1,5}"
+    r"(.{3,255}?)" + _ADMIN_STOP_RE,
+    re.I,
+)
+_ADMIN_TITLE = re.compile(r"^(?:Rechtsanw[äa]lt(?:in)?|RA(?:in)?\.?|Dr\.|Prof\.|Dipl\.\-?\w*|Herr|Frau)", re.I)
+_ADMIN_EMAIL = re.compile(r"E-?Mail\s*:?\s*([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", re.I)
+_ADMIN_PHONE = re.compile(r"Tel(?:efon)?\.?\s*:?\s*(\+?\d[\d /().\-]{4,}\d)", re.I)
+_ADMIN_HEAD_JUNK = re.compile(r"^(?:bestellt|bestimmt|ernannt|worden|zum|zur|ist|wird|hiermit|den|der|die|[:,]|\s)+", re.I)
+_ADMIN_NAME_COMMA = re.compile(r"^([^,]{3,90}?)\s*,")
+_ADMIN_NAME_FALLBACK = re.compile(r"^([^,]{3,90})")
+_ADMIN_STREET_SPLIT = re.compile(r"^(.+?) (" + _ADMIN_STREET_RE + r".*)$")
+_ADMIN_HOUSENUM_SPLIT = re.compile(
+    r"^(.+) ((?:[A-ZÄÖÜ][A-Za-zäöüß.\-]+ ){0,2}?[A-ZÄÖÜ][A-Za-zäöüß.\-]+ \d+[a-z]?(?:[ ,].*)?)$"
+)
+_ADMIN_CONTAINS_STREET = re.compile(r"( |^)" + _ADMIN_STREET_RE)
+_ADMIN_NAME_TAIL_NUM = re.compile(r"\s+[A-ZÄÖÜ][A-Za-zäöüß.\-]*\.? \d+ ?[a-z]?$")
+_ADMIN_PLZ = re.compile(r"(\d{5} [A-ZÄÖÜ][^,]{1,50}?)(?:,| Tel| Telefon| E-?Mail| Email| Internet| Fax| §|$)")
+_ADMIN_STREET_SEG = re.compile(r"(?:^|,) *([^,]{2,60}?) *, *\d{5} ")
+_ADMIN_FIRM = re.compile(r"^[ ,]*(?:c/o )?([^,]{2,80}?) *, *[^,]{2,60}?, *\d{5} ")
+
+
+def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
+    """Extract the Insolvenzverwalter block from ``announcement_text``.
+
+    Returns ``{name, firm, address, phone, email}`` — any field may be None.
+    Mirrors swift_v2.fn_parse_insolvency_admin (the DB backfill/trigger parser).
+    """
+    out: dict[str, str | None] = {
+        "name": None, "firm": None, "address": None, "phone": None, "email": None,
+    }
+    if not text or not text.strip():
+        return out
+    t = re.sub(r"\s+", " ", text)
+
+    me = _ADMIN_EMAIL.search(t)
+    email = me.group(1) if me else None
+    mp = _ADMIN_PHONE.search(t)
+    phone = mp.group(1).strip() if mp else None
+
+    mt = _ADMIN_TRIGGER.search(t)
+    if not mt:
+        return out
+    cand = _ADMIN_HEAD_JUNK.sub("", mt.group(1)).strip()
+
+    name: str | None = None
+    tail: str | None = None
+    mc = _ADMIN_NAME_COMMA.match(cand)
+    if mc:
+        name = mc.group(1).strip()
+        if _ADMIN_CONTAINS_STREET.search(name):
+            name = None  # name ran into the street → not comma-delimited
+    if name is not None:
+        tail = cand[len(name):]
+    else:
+        ms = _ADMIN_STREET_SPLIT.match(cand)
+        if ms:
+            name, tail = ms.group(1).strip(), ms.group(2)
+        else:
+            mh = _ADMIN_HOUSENUM_SPLIT.match(cand)
+            if mh:
+                name, tail = mh.group(1).strip(), mh.group(2)
+            else:
+                mf = _ADMIN_NAME_FALLBACK.match(cand)
+                name, tail = (mf.group(1).strip() if mf else None), ""
+
+    if not name or len(name) < 4:
+        return out
+    name = _ADMIN_NAME_TAIL_NUM.sub("", name).strip()
+    name = re.sub(r"[ ,;:]+$", "", name).strip()
+
+    tail = tail or ""
+    plz_m = _ADMIN_PLZ.search(tail)
+    plz = plz_m.group(1).strip() if plz_m else None
+    st_m = _ADMIN_STREET_SEG.search(tail)
+    street = st_m.group(1).strip() if st_m else None
+    address = f"{street}, {plz}" if (plz and street) else None
+
+    firm: str | None = None
+    fm = _ADMIN_FIRM.match(tail)
+    if fm:
+        firm = re.sub(r"(?i)^(?:c/o |Gerichtsfach \d+.*|Postfach \d+.*)", "", fm.group(1)).strip()
+        if (not firm or not re.search(r"[A-Za-zÄÖÜäöü]", firm)
+                or re.match(r"\d{5}", firm) or re.match(_ADMIN_STREET_RE, firm)):
+            firm = None
+
+    has_title = bool(_ADMIN_TITLE.match(name))
+    if not re.match(r"[A-ZÄÖÜ]", name):
+        return out
+    if not has_title and not address and not phone and not email:
+        return out  # reject debtor/boilerplate captures
+
+    out.update(name=name, firm=firm, address=address, phone=phone, email=email)
+    return out
+
+
 def extract_fields_from_text(text: str) -> dict[str, Any]:
     phase, is_pre = classify_phase(text)
     out: dict[str, Any] = {
         "insolvency_administrator": None,
+        "insolvency_admin_firm": None,
+        "insolvency_admin_address": None,
+        "insolvency_admin_phone": None,
+        "insolvency_admin_email": None,
         "opening_date": None,
         "claims_deadline": None,
         "announcement_type_hint": detect_announcement_type(text),
@@ -414,6 +535,13 @@ def extract_fields_from_text(text: str) -> dict[str, Any]:
     }
     if not text:
         return out
+
+    admin = parse_insolvency_admin(text)
+    out["insolvency_administrator"] = admin["name"]
+    out["insolvency_admin_firm"] = admin["firm"]
+    out["insolvency_admin_address"] = admin["address"]
+    out["insolvency_admin_phone"] = admin["phone"]
+    out["insolvency_admin_email"] = admin["email"]
 
     for pat in OPENING_PATTERNS:
         m = pat.search(text)
@@ -431,13 +559,17 @@ def extract_fields_from_text(text: str) -> dict[str, Any]:
                 out["claims_deadline"] = parsed
                 break
 
-    for pat in ADMIN_PATTERNS:
-        m = pat.search(text)
-        if m:
-            name = m.group(1).strip().rstrip(",;.:")
-            if 3 < len(name) < 120:
-                out["insolvency_administrator"] = name
-                break
+    # Legacy fallback: only if the structured parser above found no name (e.g.
+    # genitive "des Insolvenzverwalters Rechtsanwalt X" with no ist/wird/bestellt
+    # connector). Never overwrites a structured-parser result.
+    if out["insolvency_administrator"] is None:
+        for pat in ADMIN_PATTERNS:
+            m = pat.search(text)
+            if m:
+                name = m.group(1).strip().rstrip(",;.:")
+                if 3 < len(name) < 120:
+                    out["insolvency_administrator"] = name
+                    break
 
     return out
 
