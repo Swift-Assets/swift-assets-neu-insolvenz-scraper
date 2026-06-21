@@ -722,50 +722,62 @@ class SupabaseClient:
         first, capped at ``limit`` (the reserved backfill budget).
 
         Returns the raw DB rows (dicts) including ``id`` and the identity fields
-        needed to re-locate the row in a fresh listing search. We filter
-        empty-text in Python (PostgREST cannot express ``trim(text) = ''`` as a
-        simple operator) but push the cheap predicates (attempts cap, ordering,
-        a generous row limit) to the server."""
+        needed to re-locate the row in a fresh listing search.
+
+        BUG 2 (fixed here): PostgREST enforces a *server-side* ``max-rows``
+        ceiling (1000 on this project). A single ``Range``/``?limit=`` request
+        CANNOT exceed it — ``Range`` only raises the per-request page up to
+        ``max-rows``, it does not disable the cap. The previous one-shot fetch
+        therefore silently saw only the oldest 1000 empty rows every run, so any
+        backlog larger than 1000 (we have ~9k) could never fully drain: the same
+        oldest slice was re-served each run until those rows hit
+        ``max_attempts`` and dropped out. We now PAGINATE with successive
+        ``Range`` requests (each bounded by max-rows) until we have ``limit``
+        empty-text rows or the backlog is exhausted."""
         if limit <= 0:
             return []
         select = (
             "id,court,case_number,announcement_date,registry_court,"
             "registry_type,registry_number,announcement_text,detail_fetch_attempts"
         )
-        # Server-side filter for NULL text (the dominant case, >99.9% per Phase 4
-        # audit on 2026-06-20). Empty-string text is rare; we still apply the
-        # client-side trim guard for safety.
-        # Use PostgREST Range header to override the default 1000-row server cap
-        # (PostgREST's max-rows config defaults to 1000 even when ?limit= is set;
-        # see https://postgrest.org/en/stable/references/api/pagination_count.html ).
-        server_limit = max(limit * 2, limit + 50)
-        endpoint = (
+        # Deterministic order (date, then id) so offset paging can neither skip
+        # nor duplicate rows across pages. Server-side NULL-text + attempts-cap
+        # predicates keep each page cheap; the client-side trim guard below is a
+        # belt-and-braces check (is.null already excludes empty strings).
+        base = (
             f"{self.url}/rest/v1/apify_cases?select={select}"
             f"&detail_fetch_attempts=lt.{max_attempts}"
             f"&announcement_text=is.null"
-            f"&order=announcement_date.asc"
-            f"&limit={server_limit}"
+            f"&order=announcement_date.asc,id.asc"
         )
-        headers = dict(self.base_headers)
-        # Range-Unit + Range escape the PostgREST default 1000-row ceiling.
-        headers["Range-Unit"] = "items"
-        headers["Range"] = f"0-{server_limit - 1}"
-        resp = requests.get(endpoint, headers=headers, timeout=120)
-        if resp.status_code >= 400 and resp.status_code != 206:
-            log.warning("Failed to fetch empty-text backlog: %d %s",
-                        resp.status_code, resp.text[:200])
-            return []
-        rows = resp.json() or []
-        log.info("fetch_empty_text_backlog: server returned %d candidate rows (server_limit=%d)",
-                 len(rows), server_limit)
+        page_size = 1000  # PostgREST max-rows on this project = one full page
+        max_pages = 50    # hard safety bound (<=50k rows scanned) → always terminates
         out: list[dict] = []
-        for r in rows:
-            text = r.get("announcement_text")
-            if text is None or not str(text).strip():
-                out.append(r)
-                if len(out) >= limit:
-                    break
-        return out
+        offset = 0
+        for _ in range(max_pages):
+            headers = dict(self.base_headers)
+            headers["Range-Unit"] = "items"
+            headers["Range"] = f"{offset}-{offset + page_size - 1}"
+            resp = requests.get(base, headers=headers, timeout=120)
+            if resp.status_code >= 400 and resp.status_code != 206:
+                log.warning("Failed to fetch empty-text backlog (offset %d): %d %s",
+                            offset, resp.status_code, resp.text[:200])
+                break
+            rows = resp.json() or []
+            if not rows:
+                break
+            for r in rows:
+                text = r.get("announcement_text")
+                if text is None or not str(text).strip():
+                    out.append(r)
+                    if len(out) >= limit:
+                        break
+            if len(out) >= limit or len(rows) < page_size:
+                break  # have enough, or this was the last (short) page → exhausted
+            offset += page_size
+        log.info("fetch_empty_text_backlog: collected %d empty-text rows "
+                 "(limit=%d) across paginated fetch", len(out), limit)
+        return out[:limit]
 
     def resolve_ids_by_key(
         self, records: list["InsolvencyRecord"]
