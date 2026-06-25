@@ -552,7 +552,17 @@ _ADMIN_STREET_RE = (
     r"(?:[A-ZÄÖÜ][A-Za-zäöüß.\-]*(?:[Ss]tra(?:ß|ss)e|[Ss]tr\.|[Aa]llee|[Ww]eg|[Pp]latz|[Rr]ing|[Gg]asse|[Dd]amm|[Uu]fer|[Ww]all|[Cc]haussee|[Ll]andstr\.?)"
     r"|[A-ZÄÖÜ][A-Za-zäöüß.\-]+ (?:Stra(?:ß|ss)e|Str\.|Allee|Weg|Platz|Ring|Gasse|Damm|Ufer|Wall|Chaussee))\.? \d+ ?[a-z]?"
 )
-_ADMIN_STOP_RE = r"(?: Die (?:Insolvenz)?[Gg]läubiger| Insolvenzforderungen sind| Forderungen sind| §| \d\.? Die)"
+_ADMIN_STOP_RE = (
+    r"(?: Die (?:Insolvenz)?[Gg]läubiger| Insolvenzforderungen sind| Forderungen sind"
+    r"| §|\(§| \d\.? Die"
+    # Phase 0046: real appointment blocks end with a debtor-restriction clause, a
+    # "Verfügung(en)" sentence, a "(§ …)" reference, or simply END OF TEXT — none
+    # of which the old (mandatory) stop set matched, so the whole regex failed and
+    # the administrator block was lost. Add those + end-of-string so the name/
+    # address are captured.
+    r"| Der Schuldner| Die Schuldner| Den Schuldner| Dem Schuldner| Verf[üu]gung"
+    r"| bestellt| ernannt| bestimmt|$)"
+)
 _ADMIN_TRIGGER = re.compile(
     r"(?:zum |zur |zu )?(?:vorl[äa]ufige[rn]? )?"
     r"(?:Insolvenzverwalter(?:in)?|Sachwalter(?:in)?|Treuh[äa]nder(?:in)?) "
@@ -610,60 +620,70 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
                     "phone": phone, "email": email}
         return out
 
-    mt = _ADMIN_TRIGGER.search(t)
-    if not mt:
-        return _contact_only()
-    cand = _ADMIN_HEAD_JUNK.sub("", mt.group(1)).strip()
-
-    name: str | None = None
-    tail: str | None = None
-    mc = _ADMIN_NAME_COMMA.match(cand)
-    if mc:
-        name = mc.group(1).strip()
-        if _ADMIN_CONTAINS_STREET.search(name):
-            name = None  # name ran into the street → not comma-delimited
-    if name is not None:
-        tail = cand[len(name):]
-    else:
-        ms = _ADMIN_STREET_SPLIT.match(cand)
-        if ms:
-            name, tail = ms.group(1).strip(), ms.group(2)
+    # Parse one trigger-match candidate into a result dict, or None if it does
+    # not yield a plausible administrator name. Returning None lets the caller
+    # try the NEXT trigger match (Phase 0046): a generic role mention such as
+    # "Der Insolvenzverwalter ist berechtigt …" no longer shadows the real
+    # appointment block that appears later in the same announcement.
+    def _try_cand(raw: str) -> dict[str, str | None] | None:
+        cand = _ADMIN_HEAD_JUNK.sub("", raw).strip()
+        name: str | None = None
+        tail: str | None = None
+        mc = _ADMIN_NAME_COMMA.match(cand)
+        if mc:
+            name = mc.group(1).strip()
+            if _ADMIN_CONTAINS_STREET.search(name):
+                name = None  # name ran into the street → not comma-delimited
+        if name is not None:
+            tail = cand[len(name):]
         else:
-            mh = _ADMIN_HOUSENUM_SPLIT.match(cand)
-            if mh:
-                name, tail = mh.group(1).strip(), mh.group(2)
+            ms = _ADMIN_STREET_SPLIT.match(cand)
+            if ms:
+                name, tail = ms.group(1).strip(), ms.group(2)
             else:
-                mf = _ADMIN_NAME_FALLBACK.match(cand)
-                name, tail = (mf.group(1).strip() if mf else None), ""
+                mh = _ADMIN_HOUSENUM_SPLIT.match(cand)
+                if mh:
+                    name, tail = mh.group(1).strip(), mh.group(2)
+                else:
+                    mf = _ADMIN_NAME_FALLBACK.match(cand)
+                    name, tail = (mf.group(1).strip() if mf else None), ""
 
-    if not name or len(name) < 4:
-        return _contact_only()
-    name = _ADMIN_NAME_TAIL_NUM.sub("", name).strip()
-    name = re.sub(r"[ ,;:]+$", "", name).strip()
+        if not name or len(name) < 4:
+            return None
+        name = _ADMIN_NAME_TAIL_NUM.sub("", name).strip()
+        name = re.sub(r"[ ,;:]+$", "", name).strip()
 
-    tail = tail or ""
-    plz_m = _ADMIN_PLZ.search(tail)
-    plz = plz_m.group(1).strip() if plz_m else None
-    st_m = _ADMIN_STREET_SEG.search(tail)
-    street = st_m.group(1).strip() if st_m else None
-    address = f"{street}, {plz}" if (plz and street) else None
+        tail = tail or ""
+        plz_m = _ADMIN_PLZ.search(tail)
+        plz = plz_m.group(1).strip() if plz_m else None
+        if plz:  # drop a trailing sentence period (e.g. "10707 Berlin.")
+            plz = re.sub(r"[.\s]+$", "", plz)
+        st_m = _ADMIN_STREET_SEG.search(tail)
+        street = st_m.group(1).strip() if st_m else None
+        address = f"{street}, {plz}" if (plz and street) else None
 
-    firm: str | None = None
-    fm = _ADMIN_FIRM.match(tail)
-    if fm:
-        firm = re.sub(r"(?i)^(?:c/o |Gerichtsfach \d+.*|Postfach \d+.*)", "", fm.group(1)).strip()
-        if (not firm or not re.search(r"[A-Za-zÄÖÜäöü]", firm)
-                or re.match(r"\d{5}", firm) or re.match(_ADMIN_STREET_RE, firm)):
-            firm = None
+        firm: str | None = None
+        fm = _ADMIN_FIRM.match(tail)
+        if fm:
+            firm = re.sub(r"(?i)^(?:c/o |Gerichtsfach \d+.*|Postfach \d+.*)", "", fm.group(1)).strip()
+            if (not firm or not re.search(r"[A-Za-zÄÖÜäöü]", firm)
+                    or re.match(r"\d{5}", firm) or re.match(_ADMIN_STREET_RE, firm)):
+                firm = None
 
-    has_title = bool(_ADMIN_TITLE.match(name))
-    if not re.match(r"[A-ZÄÖÜ]", name):
-        return _contact_only()
-    if not has_title and not address and not phone and not email:
-        return _contact_only()  # reject debtor/boilerplate name; keep contact
+        has_title = bool(_ADMIN_TITLE.match(name))
+        if not re.match(r"[A-ZÄÖÜ]", name):
+            return None
+        if not has_title and not address and not phone and not email:
+            return None  # reject debtor/boilerplate name
+        return {"name": name, "firm": firm, "address": address,
+                "phone": phone, "email": email}
 
-    out.update(name=name, firm=firm, address=address, phone=phone, email=email)
-    return out
+    for mt in _ADMIN_TRIGGER.finditer(t):
+        res = _try_cand(mt.group(1))
+        if res is not None:
+            out.update(res)
+            return out
+    return _contact_only()
 
 
 def extract_fields_from_text(text: str) -> dict[str, Any]:

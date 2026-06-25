@@ -124,6 +124,51 @@ class TestAdminParser(unittest.TestCase):
             self.assertIsNone(r["name"])
 
 
+class TestZumBestelltColonForms(unittest.TestCase):
+    """Phase 0046: the canonical opening form
+    'Zum [vorläufigen] Insolvenzverwalter wird bestellt: Rechtsanwalt NAME,
+    Street, PLZ City' ended with a debtor clause / '(§ …)' / period, which the
+    old (mandatory) stop set did not match, so the whole block was lost."""
+
+    def test_vorlaeufig_ends_with_paragraph_ref(self):
+        r = parse_insolvency_admin(
+            "Zum vorläufigen Insolvenzverwalter wird bestellt: Rechtsanwalt "
+            "Rüdiger Wienberg, Düsseldorfer Straße 38, 10707 Berlin. Verfügungen "
+            "der Schuldnerin sind nur mit Zustimmung wirksam (§ 21 Abs. 2 Nr. 2 InsO)."
+        )
+        self.assertEqual(r["name"], "Rechtsanwalt Rüdiger Wienberg")
+        self.assertEqual(r["address"], "Düsseldorfer Straße 38, 10707 Berlin")
+
+    def test_plain_ends_with_debtor_clause(self):
+        r = parse_insolvency_admin(
+            "Zum Insolvenzverwalter wird bestellt: Rechtsanwalt Christoph G. Rapp, "
+            "Friedrich-Ebert-Anlage 24, 69117 Heidelberg Der Schuldnerin wird die "
+            "Verfügung über ihr Vermögen verboten."
+        )
+        self.assertEqual(r["name"], "Rechtsanwalt Christoph G. Rapp")
+        self.assertEqual(r["address"], "Friedrich-Ebert-Anlage 24, 69117 Heidelberg")
+
+    def test_co_firm_with_contact(self):
+        r = parse_insolvency_admin(
+            "Zum Insolvenzverwalter wird bestellt: Rechtsanwalt Sebastian Netzel, "
+            "c/o Brinkmann & Partner, Colmarer Straße 5, 60528 Frankfurt am Main, "
+            "Tel.: 069/37 0022-0, Fax: 069/37 0022-111. Der Schuldnerin wird die "
+            "Verfügung verboten."
+        )
+        self.assertEqual(r["name"], "Rechtsanwalt Sebastian Netzel")
+        self.assertEqual(r["firm"], "Brinkmann & Partner")
+        self.assertEqual(r["address"], "Colmarer Straße 5, 60528 Frankfurt am Main")
+        self.assertEqual(r["phone"], "069/37 0022-0")
+
+    def test_block_at_end_of_text(self):
+        r = parse_insolvency_admin(
+            "Zum Insolvenzverwalter wird bestellt: Rechtsanwalt Max Mustermann, "
+            "Hauptstr 1, 12345 Stadt."
+        )
+        self.assertEqual(r["name"], "Rechtsanwalt Max Mustermann")
+        self.assertEqual(r["address"], "Hauptstr 1, 12345 Stadt")
+
+
 class TestContactOnlyFallback(unittest.TestCase):
     """Phase 0044: when no administrator NAME can be anchored but a labelled
     email/phone is present AND an administrator role is mentioned, return the
