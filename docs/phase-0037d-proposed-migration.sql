@@ -1,0 +1,80 @@
+-- =============================================================================
+-- PHASE 0037D — PROPOSED migration (DO NOT APPLY in Phase 0037D)
+-- =============================================================================
+-- Phase 0037D fixes the SCRAPER so that, for every new run, it now produces:
+--   * announcement_type_hint  (robust, umlaut-folded classifier)
+--   * announcement_type_raw    (audit value, in external_raw)
+--   * content_hash             (deterministic stable id)
+--   * source_url               (page-level provenance)
+--   * external_raw             (provenance object / raw_json groundwork)
+--
+-- BUT the current persistence path cannot store all of them yet:
+--
+--   1. public.neu_insolvenz_fill_only_upsert(jsonb) reads only a FIXED column
+--      list and silently ignores the extra keys (source_url, content_hash,
+--      external_raw, insolvenzindex_publication_id, insolvenzindex_company_id).
+--      => announcement_type_hint IS already persisted by it (column exists);
+--         the others are dropped.
+--
+--   2. public.apify_cases has NO source_url and NO content_hash columns.
+--      (insolvenzindex_publication_id / insolvenzindex_company_id columns DO
+--       exist but the RPC never writes them.)
+--
+--   3. swift_v2.backfill_neu_insolvenz_direct_entities(int) NEVER sets
+--      source_neu_insolvenz_announcements.source_url in its INSERT — that is
+--      why source_url is NULL in 100% of rows regardless of the scraper. It
+--      derives content_hash as md5(announcement_text) (so content_hash is NULL
+--      exactly when announcement_text is NULL).
+--
+-- This file is the PROPOSED change-set to actually persist the new fields. It
+-- is intentionally NOT applied in Phase 0037D (no migration apply / no prod
+-- writes). Apply it in the approved Phase 0037E/0037F recovery window after
+-- review.
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- 1. New columns on public.apify_cases (additive, nullable — safe).
+-- ---------------------------------------------------------------------------
+-- ALTER TABLE public.apify_cases
+--   ADD COLUMN IF NOT EXISTS source_url   text,
+--   ADD COLUMN IF NOT EXISTS content_hash text,
+--   ADD COLUMN IF NOT EXISTS external_raw jsonb;
+
+-- ---------------------------------------------------------------------------
+-- 2. Extend public.neu_insolvenz_fill_only_upsert to read the new keys.
+--    (Only the INSERT column list + the fill-only UPDATE branch need the new
+--     COALESCE-guarded assignments; identity/matching logic is unchanged.)
+--    INSERT additions:
+--        source_url,   <- v_rec->>'source_url'
+--        content_hash, <- v_rec->>'content_hash'
+--        external_raw, <- CASE WHEN v_rec ? 'external_raw' THEN v_rec->'external_raw' ELSE NULL END,
+--        insolvenzindex_publication_id <- NULLIF(v_rec->>'insolvenzindex_publication_id',''),
+--        insolvenzindex_company_id     <- NULLIF(v_rec->>'insolvenzindex_company_id','')
+--    UPDATE (fill-only) additions, e.g.:
+--        source_url   = COALESCE(source_url,   NULLIF(v_rec->>'source_url','')),
+--        content_hash = COALESCE(content_hash, NULLIF(v_rec->>'content_hash','')),
+--        external_raw = CASE WHEN external_raw IS NULL AND v_rec ? 'external_raw'
+--                            THEN v_rec->'external_raw' ELSE external_raw END,
+--        insolvenzindex_publication_id =
+--            COALESCE(insolvenzindex_publication_id, NULLIF(v_rec->>'insolvenzindex_publication_id','')),
+--        insolvenzindex_company_id =
+--            COALESCE(insolvenzindex_company_id, NULLIF(v_rec->>'insolvenzindex_company_id',''))
+
+-- ---------------------------------------------------------------------------
+-- 3. Extend swift_v2.backfill_neu_insolvenz_direct_entities so source_url flows
+--    into swift_v2.source_neu_insolvenz_announcements.source_url:
+--      * add `source_url` to the `prepared` projection (ac.source_url),
+--      * add `source_url` to the INSERT column list + SELECT,
+--      * add to the ON CONFLICT DO UPDATE set:
+--          source_url = COALESCE(excluded.source_url,
+--                                swift_v2.source_neu_insolvenz_announcements.source_url)
+--    content_hash already derives from md5(announcement_text); optionally fall
+--    back to the scraper-provided ac.content_hash when text is empty:
+--          content_hash = COALESCE(
+--              CASE WHEN announcement_text <> '' THEN md5(announcement_text) END,
+--              ac.content_hash)
+--    Because raw_json := to_jsonb(src), the new apify_cases columns
+--    (source_url, content_hash, external_raw, insolvenzindex_*) automatically
+--    appear inside swift_v2.source_neu_insolvenz_announcements.raw_json once
+--    step 1+2 land — no further sync change required for those.
+-- =============================================================================

@@ -37,6 +37,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -124,11 +125,36 @@ class InsolvencyRecord:
     registry_number: str | None = None
     announcement_text: str | None = None
     insolvency_administrator: str | None = None
+    # Structured administrator contact subfields (Phase 0044). These are parsed
+    # by parse_insolvency_admin() but were previously dropped before persistence
+    # (not on the model, not assigned, not in the payload).
+    insolvency_admin_firm: str | None = None
+    insolvency_admin_address: str | None = None
+    insolvency_admin_phone: str | None = None
+    insolvency_admin_email: str | None = None
     opening_date: str | None = None
     claims_deadline: str | None = None
     announcement_type_hint: str | None = None
     insolvency_phase: str | None = None        # see classify_phase()
     is_pre_verteilung: bool | None = None       # True = potentially acquirable
+    # ---- Source-identity / provenance fields (Phase 0037D) -----------------
+    # source_url     : page-level provenance (the public portal page the row is
+    #                  published on). The JSF source exposes NO per-announcement
+    #                  GET permalink, so this is page-level, not a unique deep
+    #                  link — never fabricated into a fake per-row URL.
+    # content_hash   : deterministic stable identity over the proceeding key +
+    #                  full text. Always computable, even when announcement_text
+    #                  is empty, so a row has a stable external id from day one.
+    # announcement_type_raw : the umlaut-folded keyword that produced
+    #                  announcement_type_hint, preserved so the canonicalization
+    #                  is auditable/reversible (kept in raw_json, never guessed).
+    # insolvenzindex_*      : populated only if the source ever exposes them
+    #                  (it does not via the current JSF flow) — never fabricated.
+    source_url: str | None = None
+    content_hash: str | None = None
+    announcement_type_raw: str | None = None
+    insolvenzindex_publication_id: str | None = None
+    insolvenzindex_company_id: str | None = None
     scraped_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -183,6 +209,20 @@ class InsolvencyRecord:
         # guards this, but we keep the scraper honest too.)
         elif d.get("insolvency_phase") == PHASE_UNKNOWN:
             d["insolvency_phase"] = None
+        # ---- Source-identity / provenance (Phase 0037D) --------------------
+        # Always attach a deterministic content_hash (stable external id) and a
+        # raw_json/external_raw provenance object. These are forward-compatible
+        # groundwork: the CURRENT public.neu_insolvenz_fill_only_upsert RPC reads
+        # only a fixed column list and silently ignores the extra keys, and
+        # public.apify_cases has no source_url/content_hash columns yet — so they
+        # are persisted ONLY once the proposed migration in
+        # docs/phase-0037d-proposed-migration.sql extends the RPC + the
+        # swift_v2 sync to consume them (Phase 0037E/0037F). Sending them now is
+        # harmless (ignored keys) and lets the migration land without a second
+        # scraper change.
+        if not d.get("content_hash"):
+            d["content_hash"] = self.compute_content_hash()
+        d["external_raw"] = self.build_external_raw(d["content_hash"])
         # Keep nullable fields part of the unique constraint even if None
         keep_null = {
             "announcement_date", "case_number", "court",
@@ -190,6 +230,39 @@ class InsolvencyRecord:
             "registry_type", "registry_number",
         }
         return {k: v for k, v in d.items() if v is not None or k in keep_null}
+
+    def compute_content_hash(self) -> str:
+        """Deterministic stable identity for the announcement.
+
+        Hashes the stable proceeding key (court/case/date/registry/type) plus
+        the announcement text, so the SAME announcement always yields the SAME
+        hash and a row has a usable external id even before its detail text is
+        fetched. SHA-256 over a pipe-joined, normalized basis. (Distinct from
+        the downstream ``md5(announcement_text)`` the swift_v2 sync computes:
+        that hashes only the body; this anchors the proceeding identity.)"""
+        basis = "|".join(
+            (_norm_key_val(v) or "") for v in (
+                self.court, self.case_number, self.announcement_date,
+                self.registry_court, self.registry_type, self.registry_number,
+                self.announcement_type_hint, self.announcement_text,
+            )
+        )
+        return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+    def build_external_raw(self, content_hash: str) -> dict[str, Any]:
+        """Provenance object mirrored into raw_json downstream. Holds the raw
+        (folded) announcement-type keyword, the content hash, the page-level
+        source URL and any source ids — never debtor identity, so it is safe to
+        store for natural-person rows."""
+        return {
+            "source_actor": self.source_actor,
+            "source_url": self.source_url,
+            "content_hash": content_hash,
+            "announcement_type_hint": self.announcement_type_hint,
+            "announcement_type_raw": self.announcement_type_raw,
+            "insolvenzindex_publication_id": self.insolvenzindex_publication_id,
+            "insolvenzindex_company_id": self.insolvenzindex_company_id,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -247,39 +320,98 @@ def parse_register_info(register_info: str | None) -> dict[str, str | None]:
 
 # ----- Announcement type detection ------------------------------------------
 
-TYPE_KEYWORDS = [
-    # Order matters: more specific first
-    ("Abweisung mangels Masse", "Abweisung mangels Masse"),
-    ("Restschuldbefreiung", "Restschuldbefreiung"),
-    ("Sicherungsmaßnahme", "Sicherungsmaßnahmen"),
-    ("Schlusstermin", "Schlusstermin"),
-    ("Schlussverteilung", "Schlussverteilung"),
+# Ordered, umlaut-FOLDED keyword -> canonical announcement-type label.
+#
+# Matching is done against the umlaut-/ß-folded, whitespace-normalized text
+# (see _normalize_de), so every keyword here is written in its folded form
+# ("ä"->"ae", "ö"->"oe", "ü"->"ue", "ß"->"ss"). This is the Phase 0037D
+# hardening: the previous list matched raw `.lower()` text, so portal spellings
+# using ae/oe/ue/ss slipped through as NULL. Order matters — most specific
+# first so "Schlussverteilung" beats "Verteilung", "... mangels Masse" beats a
+# bare verb, and a preliminary-administration phrase beats a bare "Anordnung".
+TYPE_KEYWORDS: list[tuple[str, str]] = [
+    # Closure / dismissal (most specific multiword first)
+    ("abweisung mangels masse", "Abweisung mangels Masse"),
+    ("einstellung mangels masse", "Einstellung mangels Masse"),
+    ("masseunzulaenglichkeit", "Masseunzulänglichkeit"),
+    ("restschuldbefreiung", "Restschuldbefreiung"),
+    # Remuneration
+    ("verguetungsfestsetzung", "Vergütungsfestsetzung"),
+    ("verguetung", "Vergütungsfestsetzung"),
+    # Securing measures / preliminary administration
+    ("anordnung der vorlaeufigen", "Sicherungsmaßnahmen"),
+    ("vorlaeufige insolvenzverwalt", "Sicherungsmaßnahmen"),
+    ("vorlaeufiger insolvenzverwalt", "Sicherungsmaßnahmen"),
+    ("sicherungsmassnahme", "Sicherungsmaßnahmen"),
+    # Final distribution / closing date (before generic Verteilung)
+    ("schlussverteilung", "Schlussverteilung"),
+    ("schlusstermin", "Schlussverteilung"),
+    # Realisation / distribution
+    ("masseverwertung", "Verwertung"),
+    ("verwertung", "Verwertung"),
+    ("verteilungsverzeichnis", "Verteilung"),
+    ("verteilung", "Verteilung"),
+    # Hearings
+    ("berichtstermin", "Berichtstermin"),
+    ("pruefungstermin", "Prüfungstermin"),
+    # Lifting of proceedings
+    ("aufhebung", "Aufhebung"),
     ("aufgehoben", "Aufhebung"),
-    ("Aufhebung", "Aufhebung"),
-    ("eröffnet", "Eröffnung"),
-    ("Eröffnung", "Eröffnung"),
+    # Opening (specific phrasings before bare stems)
+    ("eroeffnung des insolvenzverfahrens", "Eröffnung"),
+    ("insolvenzverfahren eroeffnet", "Eröffnung"),
+    ("eroeffnung", "Eröffnung"),
     ("eroeffnet", "Eröffnung"),
-    ("Eroeffnung", "Eröffnung"),
+    # Discontinuation (generic, after "mangels Masse" above)
+    ("einstellung", "Einstellung"),
     ("eingestellt", "Einstellung"),
-    ("Einstellung", "Einstellung"),
+    # Orders (generic, after the preliminary-administration phrases above)
+    ("anordnung", "Anordnung"),
     ("angeordnet", "Anordnung"),
-    ("Anordnung", "Anordnung"),
-    ("festgesetzt", "Vergütungsfestsetzung"),
-    ("Vergütungsfestsetzung", "Vergütungsfestsetzung"),
-    ("Bestellung", "Bestellung"),
-    ("Berichtstermin", "Berichtstermin"),
-    ("Prüfungstermin", "Prüfungstermin"),
+    # Appointment (lowest priority — most openings also mention it)
+    ("bestellung", "Bestellung"),
+    ("bestellt", "Bestellung"),
+    # ---- Phase 0037F-A extension: small high-confidence gaps ---------------
+    # Appended at the LOWEST priority so existing classifications can NEVER
+    # change (these fire only when no keyword above matched). All are late-stage
+    # / administrative announcement types — conservatively surfaced as 'monitor'
+    # in the cockpit (swift_v2.fn_cockpit_phase_*), never pre-Verteilung. Generic
+    # "Beschluss"/"Termin" are deliberately NOT added (ambiguous → keep NULL).
+    ("insolvenzplan", "Insolvenzplan"),
+    ("schlussrechnung", "Schlussrechnung"),
+    ("glaeubigerversammlung", "Gläubigerversammlung"),
+    ("glaeubigerausschuss", "Gläubigerversammlung"),
+    ("treuhaender", "Treuhänder"),
+    ("verfahrenskostenstundung", "Verfahrenskostenstundung"),
+    ("stundung", "Verfahrenskostenstundung"),
 ]
 
 
-def detect_announcement_type(text: str) -> str | None:
+def detect_announcement_type_full(text: str) -> tuple[str | None, str | None]:
+    """Detect the announcement type from the FULL announcement text.
+
+    Returns ``(canonical_hint, raw_keyword)``:
+      - ``canonical_hint``: a clean canonical label (e.g. ``"Eröffnung"``), or
+        None when the text contains no recognizable type. NEVER fabricated and
+        NEVER inferred from the debtor name or natural-person status — only from
+        the announcement body itself.
+      - ``raw_keyword``: the umlaut-folded source keyword that matched, kept in
+        raw_json so the canonicalization stays auditable/reversible.
+
+    Matching uses ``_normalize_de`` so ä/ae, ö/oe, ü/ue and ß/ss spellings all
+    resolve to the same canonical label."""
     if not text:
-        return None
-    lower = text.lower()
+        return None, None
+    norm = _normalize_de(text)
     for keyword, label in TYPE_KEYWORDS:
-        if keyword.lower() in lower:
-            return label
-    return None
+        if keyword in norm:
+            return label, keyword
+    return None, None
+
+
+def detect_announcement_type(text: str) -> str | None:
+    """Backward-compatible wrapper returning only the canonical hint."""
+    return detect_announcement_type_full(text)[0]
 
 
 # ----- Insolvency phase classification --------------------------------------
@@ -443,6 +575,12 @@ _ADMIN_NAME_TAIL_NUM = re.compile(r"\s+[A-ZÄÖÜ][A-Za-zäöüß.\-]*\.? \d+ ?[
 _ADMIN_PLZ = re.compile(r"(\d{5} [A-ZÄÖÜ][^,]{1,50}?)(?:,| Tel| Telefon| E-?Mail| Email| Internet| Fax| §|$)")
 _ADMIN_STREET_SEG = re.compile(r"(?:^|,) *([^,]{2,60}?) *, *\d{5} ")
 _ADMIN_FIRM = re.compile(r"^[ ,]*(?:c/o )?([^,]{2,80}?) *, *[^,]{2,60}?, *\d{5} ")
+# Presence of an administrator role anywhere in the text. Used to safely return
+# a labelled E-Mail:/Tel.: contact even when the NAME block could not be anchored
+# (Phase 0044): in an insolvency announcement that contact is the administrator's
+# office, so it is valuable for outreach and safe to keep — name/firm/address are
+# still left None (never guessed without the trigger anchor).
+_ADMIN_ROLE_HINT = re.compile(r"Insolvenzverwalter|Sachwalter|Treuh[äa]nder", re.I)
 
 
 def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
@@ -463,9 +601,18 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
     mp = _ADMIN_PHONE.search(t)
     phone = mp.group(1).strip() if mp else None
 
+    # Contact-only fallback: when no administrator NAME can be anchored, still
+    # surface a labelled email/phone (the administrator's office contact) as long
+    # as an administrator role is mentioned. name/firm/address stay None.
+    def _contact_only() -> dict[str, str | None]:
+        if (email or phone) and _ADMIN_ROLE_HINT.search(t):
+            return {"name": None, "firm": None, "address": None,
+                    "phone": phone, "email": email}
+        return out
+
     mt = _ADMIN_TRIGGER.search(t)
     if not mt:
-        return out
+        return _contact_only()
     cand = _ADMIN_HEAD_JUNK.sub("", mt.group(1)).strip()
 
     name: str | None = None
@@ -490,7 +637,7 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
                 name, tail = (mf.group(1).strip() if mf else None), ""
 
     if not name or len(name) < 4:
-        return out
+        return _contact_only()
     name = _ADMIN_NAME_TAIL_NUM.sub("", name).strip()
     name = re.sub(r"[ ,;:]+$", "", name).strip()
 
@@ -511,9 +658,9 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
 
     has_title = bool(_ADMIN_TITLE.match(name))
     if not re.match(r"[A-ZÄÖÜ]", name):
-        return out
+        return _contact_only()
     if not has_title and not address and not phone and not email:
-        return out  # reject debtor/boilerplate captures
+        return _contact_only()  # reject debtor/boilerplate name; keep contact
 
     out.update(name=name, firm=firm, address=address, phone=phone, email=email)
     return out
@@ -521,6 +668,7 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
 
 def extract_fields_from_text(text: str) -> dict[str, Any]:
     phase, is_pre = classify_phase(text)
+    type_hint, type_raw = detect_announcement_type_full(text)
     out: dict[str, Any] = {
         "insolvency_administrator": None,
         "insolvency_admin_firm": None,
@@ -529,7 +677,8 @@ def extract_fields_from_text(text: str) -> dict[str, Any]:
         "insolvency_admin_email": None,
         "opening_date": None,
         "claims_deadline": None,
-        "announcement_type_hint": detect_announcement_type(text),
+        "announcement_type_hint": type_hint,
+        "announcement_type_raw": type_raw,
         "insolvency_phase": phase,
         "is_pre_verteilung": is_pre,
     }
@@ -709,6 +858,11 @@ class NeuInsolvenzScraper:
                 registry_court=reg_parsed["registry_court"],
                 registry_type=reg_parsed["registry_type"],
                 registry_number=reg_parsed["registry_number"],
+                # Page-level provenance: the public portal page where this
+                # announcement is published/searchable. The JSF source exposes
+                # no per-announcement GET permalink, so this is intentionally
+                # page-level, not a fabricated unique deep link.
+                source_url=f"{BASE_URL}{RESULT_PATH}",
                 _row_index=row_index,
                 _button_id=button_id,
             )
@@ -1409,9 +1563,14 @@ def fetch_details_with_pool(
                     rec.announcement_text = text
                     fields = extract_fields_from_text(text)
                     rec.insolvency_administrator = fields["insolvency_administrator"]
+                    rec.insolvency_admin_firm = fields["insolvency_admin_firm"]
+                    rec.insolvency_admin_address = fields["insolvency_admin_address"]
+                    rec.insolvency_admin_phone = fields["insolvency_admin_phone"]
+                    rec.insolvency_admin_email = fields["insolvency_admin_email"]
                     rec.opening_date = fields["opening_date"]
                     rec.claims_deadline = fields["claims_deadline"]
                     rec.announcement_type_hint = fields["announcement_type_hint"]
+                    rec.announcement_type_raw = fields["announcement_type_raw"]
                     rec.insolvency_phase = fields["insolvency_phase"]
                     rec.is_pre_verteilung = fields["is_pre_verteilung"]
                     done += 1
@@ -1437,6 +1596,120 @@ def fetch_details_with_pool(
             except Exception as e:  # noqa: BLE001
                 log.warning("A detail-fetch worker raised and was isolated: %s", e)
     return total_done
+
+
+# ---------------------------------------------------------------------------
+# Run diagnostics / guardrails (Phase 0037D)
+# ---------------------------------------------------------------------------
+
+# Warn (and optionally fail) when extraction quality regresses. A textless row
+# legitimately has no type, so the type-coverage guard is measured ONLY over
+# rows that DO have announcement_text (a classifier-quality signal), not over
+# every parsed row (most rows carry no text by design on a budget-capped run).
+TYPE_COVERAGE_WARN_RATIO = 0.20   # warn if >20% of text-bearing rows lack a type
+URL_COVERAGE_WARN_RATIO = 0.20    # warn if >20% of rows lack a source_url
+# Hard-fail is OFF by default so a normal day (where most rows have no detail
+# text yet) cannot break production. Set FAIL_ON_LOW_COVERAGE=1 to escalate the
+# warnings below into a non-zero exit (e.g. in a dedicated QA workflow).
+FAIL_ON_LOW_COVERAGE = os.getenv("FAIL_ON_LOW_COVERAGE", "0") == "1"
+
+
+def _nonempty(v: Any) -> bool:
+    return v is not None and str(v).strip() != ""
+
+
+def compute_coverage_metrics(records: list[InsolvencyRecord]) -> dict[str, int]:
+    """Non-sensitive run diagnostics (counts only — never debtor names or text).
+
+    Returns counts used both for logging and for the coverage guardrails."""
+    total = len(records)
+    with_text = sum(1 for r in records if _nonempty(r.announcement_text))
+    with_type = sum(1 for r in records if _nonempty(r.announcement_type_hint))
+    with_url = sum(1 for r in records if _nonempty(r.source_url))
+    with_pub = sum(1 for r in records if _nonempty(r.insolvenzindex_publication_id))
+    with_hash = sum(1 for r in records if _nonempty(r.content_hash))
+    text_no_type = sum(
+        1 for r in records
+        if _nonempty(r.announcement_text) and not _nonempty(r.announcement_type_hint)
+    )
+    return {
+        "total": total,
+        "with_text": with_text,
+        "missing_text": total - with_text,
+        "with_type": with_type,
+        "missing_type": total - with_type,
+        "with_source_url": with_url,
+        "with_publication_id": with_pub,
+        "with_content_hash": with_hash,
+        "text_but_no_type": text_no_type,
+    }
+
+
+def log_coverage_and_guardrails(records: list[InsolvencyRecord]) -> bool:
+    """Emit non-sensitive coverage diagnostics and evaluate the guardrails.
+
+    Returns True if a guardrail tripped (caller decides whether to fail). Never
+    logs debtor names or announcement text — counts only."""
+    # content_hash is computed lazily in to_db_dict(); make sure it exists for
+    # the metric (does not mutate the DB payload path).
+    for r in records:
+        if not _nonempty(r.content_hash):
+            r.content_hash = r.compute_content_hash()
+    m = compute_coverage_metrics(records)
+    log.info(
+        "Run diagnostics: parsed=%d | text=%d (missing=%d) | type_hint=%d "
+        "(missing=%d) | source_url=%d | publication_id=%d | content_hash=%d",
+        m["total"], m["with_text"], m["missing_text"], m["with_type"],
+        m["missing_type"], m["with_source_url"], m["with_publication_id"],
+        m["with_content_hash"],
+    )
+    tripped = False
+    if m["with_text"] > 0:
+        ratio = m["text_but_no_type"] / m["with_text"]
+        if ratio > TYPE_COVERAGE_WARN_RATIO:
+            tripped = True
+            log.warning(
+                "GUARDRAIL: %d/%d (%.1f%%) of text-bearing rows have NO "
+                "announcement_type_hint (threshold %.0f%%) — classifier gap or "
+                "unexpected announcement wording. Investigate TYPE_KEYWORDS.",
+                m["text_but_no_type"], m["with_text"], 100.0 * ratio,
+                100.0 * TYPE_COVERAGE_WARN_RATIO,
+            )
+    if m["total"] > 0:
+        missing_url_ratio = (m["total"] - m["with_source_url"]) / m["total"]
+        if missing_url_ratio > URL_COVERAGE_WARN_RATIO:
+            tripped = True
+            log.warning(
+                "GUARDRAIL: %d/%d (%.1f%%) of rows lack a source_url "
+                "(threshold %.0f%%) — provenance not captured.",
+                m["total"] - m["with_source_url"], m["total"],
+                100.0 * missing_url_ratio, 100.0 * URL_COVERAGE_WARN_RATIO,
+            )
+    return tripped
+
+
+# Fields that may carry natural-person identity or full announcement bodies and
+# must never be printed in full to logs (privacy). Shown as redacted summaries.
+_SENSITIVE_LOG_FIELDS = {
+    "debtor_name", "debtor_city", "announcement_text", "external_raw",
+    "insolvency_administrator", "register_info",
+}
+
+
+def _redact_for_log(key: str, value: Any) -> Any:
+    """Privacy-safe rendering of a record field for DRY_RUN/sample logging.
+
+    Natural persons make up the bulk of the source, so debtor identity and the
+    full announcement body are NEVER emitted — only a redacted length/type
+    summary. Non-sensitive structured fields are shown (truncated)."""
+    if value is None:
+        return None
+    if key in _SENSITIVE_LOG_FIELDS:
+        if isinstance(value, str):
+            return f"<redacted:{len(value)} chars>"
+        return "<redacted>"
+    s = str(value)
+    return (s[:140] + "...") if len(s) > 140 else value
 
 
 def main() -> int:
@@ -1562,14 +1835,18 @@ def main() -> int:
             log.info("Detail fetches done: %d/%d in %.1fs (%.2fs avg)",
                      fetched, len(to_fetch), elapsed, elapsed / max(1, fetched))
 
+    # Coverage diagnostics + guardrails over everything we are about to persist
+    # (counts only — privacy-safe). Computed for both dry-run and real runs.
+    persist_set = listing + extra_persist
+    guardrail_tripped = log_coverage_and_guardrails(persist_set)
+
     # Phase 3: persist
     if dry_run:
-        log.info("DRY_RUN=1 — printing sample record and exiting.")
+        log.info("DRY_RUN=1 — printing REDACTED sample record and exiting.")
         if listing:
             sample = next((r for r in listing if r.announcement_text), listing[0])
             for k, v in sample.to_db_dict().items():
-                preview = (str(v)[:140] + "...") if v and len(str(v)) > 140 else v
-                log.info("  %s = %r", k, preview)
+                log.info("  %s = %r", k, _redact_for_log(k, v))
             # Always surface the computed phase classification in dry-run, even
             # when WRITE_PHASE_FIELDS is off (so they are excluded from to_db_dict).
             log.info("  insolvency_phase = %r", sample.insolvency_phase)
@@ -1635,6 +1912,16 @@ def main() -> int:
             "acceptable threshold, treating run as success.",
             dupes, 100.0 * dupes / max(total, 1),
         )
+
+    # Coverage guardrails: warnings always emitted above; escalate to a non-zero
+    # exit only when explicitly opted in (FAIL_ON_LOW_COVERAGE=1), so a normal
+    # day cannot break production.
+    if guardrail_tripped and FAIL_ON_LOW_COVERAGE:
+        log.error(
+            "FAIL: extraction-coverage guardrail tripped and FAIL_ON_LOW_COVERAGE=1. "
+            "See GUARDRAIL warnings above.")
+        return 1
+
     return 0
 
 
