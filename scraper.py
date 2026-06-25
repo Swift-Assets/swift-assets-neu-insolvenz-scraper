@@ -125,6 +125,13 @@ class InsolvencyRecord:
     registry_number: str | None = None
     announcement_text: str | None = None
     insolvency_administrator: str | None = None
+    # Structured administrator contact subfields (Phase 0044). These are parsed
+    # by parse_insolvency_admin() but were previously dropped before persistence
+    # (not on the model, not assigned, not in the payload).
+    insolvency_admin_firm: str | None = None
+    insolvency_admin_address: str | None = None
+    insolvency_admin_phone: str | None = None
+    insolvency_admin_email: str | None = None
     opening_date: str | None = None
     claims_deadline: str | None = None
     announcement_type_hint: str | None = None
@@ -568,6 +575,12 @@ _ADMIN_NAME_TAIL_NUM = re.compile(r"\s+[A-ZÄÖÜ][A-Za-zäöüß.\-]*\.? \d+ ?[
 _ADMIN_PLZ = re.compile(r"(\d{5} [A-ZÄÖÜ][^,]{1,50}?)(?:,| Tel| Telefon| E-?Mail| Email| Internet| Fax| §|$)")
 _ADMIN_STREET_SEG = re.compile(r"(?:^|,) *([^,]{2,60}?) *, *\d{5} ")
 _ADMIN_FIRM = re.compile(r"^[ ,]*(?:c/o )?([^,]{2,80}?) *, *[^,]{2,60}?, *\d{5} ")
+# Presence of an administrator role anywhere in the text. Used to safely return
+# a labelled E-Mail:/Tel.: contact even when the NAME block could not be anchored
+# (Phase 0044): in an insolvency announcement that contact is the administrator's
+# office, so it is valuable for outreach and safe to keep — name/firm/address are
+# still left None (never guessed without the trigger anchor).
+_ADMIN_ROLE_HINT = re.compile(r"Insolvenzverwalter|Sachwalter|Treuh[äa]nder", re.I)
 
 
 def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
@@ -588,9 +601,18 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
     mp = _ADMIN_PHONE.search(t)
     phone = mp.group(1).strip() if mp else None
 
+    # Contact-only fallback: when no administrator NAME can be anchored, still
+    # surface a labelled email/phone (the administrator's office contact) as long
+    # as an administrator role is mentioned. name/firm/address stay None.
+    def _contact_only() -> dict[str, str | None]:
+        if (email or phone) and _ADMIN_ROLE_HINT.search(t):
+            return {"name": None, "firm": None, "address": None,
+                    "phone": phone, "email": email}
+        return out
+
     mt = _ADMIN_TRIGGER.search(t)
     if not mt:
-        return out
+        return _contact_only()
     cand = _ADMIN_HEAD_JUNK.sub("", mt.group(1)).strip()
 
     name: str | None = None
@@ -615,7 +637,7 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
                 name, tail = (mf.group(1).strip() if mf else None), ""
 
     if not name or len(name) < 4:
-        return out
+        return _contact_only()
     name = _ADMIN_NAME_TAIL_NUM.sub("", name).strip()
     name = re.sub(r"[ ,;:]+$", "", name).strip()
 
@@ -636,9 +658,9 @@ def parse_insolvency_admin(text: str | None) -> dict[str, str | None]:
 
     has_title = bool(_ADMIN_TITLE.match(name))
     if not re.match(r"[A-ZÄÖÜ]", name):
-        return out
+        return _contact_only()
     if not has_title and not address and not phone and not email:
-        return out  # reject debtor/boilerplate captures
+        return _contact_only()  # reject debtor/boilerplate name; keep contact
 
     out.update(name=name, firm=firm, address=address, phone=phone, email=email)
     return out
@@ -1541,6 +1563,10 @@ def fetch_details_with_pool(
                     rec.announcement_text = text
                     fields = extract_fields_from_text(text)
                     rec.insolvency_administrator = fields["insolvency_administrator"]
+                    rec.insolvency_admin_firm = fields["insolvency_admin_firm"]
+                    rec.insolvency_admin_address = fields["insolvency_admin_address"]
+                    rec.insolvency_admin_phone = fields["insolvency_admin_phone"]
+                    rec.insolvency_admin_email = fields["insolvency_admin_email"]
                     rec.opening_date = fields["opening_date"]
                     rec.claims_deadline = fields["claims_deadline"]
                     rec.announcement_type_hint = fields["announcement_type_hint"]

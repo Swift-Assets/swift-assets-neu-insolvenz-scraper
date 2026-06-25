@@ -76,6 +76,10 @@ class _WorkerPoolTestBase(unittest.TestCase):
             scraper, "extract_fields_from_text",
             lambda text: {
                 "insolvency_administrator": None,
+                "insolvency_admin_firm": None,
+                "insolvency_admin_address": None,
+                "insolvency_admin_phone": None,
+                "insolvency_admin_email": None,
                 "opening_date": None,
                 "claims_deadline": None,
                 "announcement_type_hint": None,

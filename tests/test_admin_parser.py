@@ -13,7 +13,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scraper import parse_insolvency_admin  # noqa: E402
+from scraper import (  # noqa: E402
+    parse_insolvency_admin,
+    extract_fields_from_text,
+    InsolvencyRecord,
+)
 
 
 class TestAdminParser(unittest.TestCase):
@@ -118,6 +122,88 @@ class TestAdminParser(unittest.TestCase):
         for v in (None, "", "   "):
             r = parse_insolvency_admin(v)
             self.assertIsNone(r["name"])
+
+
+class TestContactOnlyFallback(unittest.TestCase):
+    """Phase 0044: when no administrator NAME can be anchored but a labelled
+    email/phone is present AND an administrator role is mentioned, return the
+    contact (administrator's office) so outreach data is not lost. name/firm/
+    address stay None (never guessed)."""
+
+    def test_contact_returned_without_name_when_role_present(self):
+        # A follow-up announcement (e.g. Berichtstermin) that references the
+        # already-appointed administrator only by contact, with no parseable
+        # appointment-name structure.
+        text = (
+            "Im Insolvenzverfahren wird Berichtstermin bestimmt. Rückfragen an "
+            "den Insolvenzverwalter unter Tel.: 030 9988776, "
+            "E-Mail: kanzlei@example.de."
+        )
+        r = parse_insolvency_admin(text)
+        self.assertIsNone(r["name"])
+        self.assertIsNone(r["firm"])
+        self.assertIsNone(r["address"])
+        self.assertEqual(r["phone"], "030 9988776")
+        self.assertEqual(r["email"], "kanzlei@example.de")
+
+    def test_no_role_does_not_grab_unrelated_contact(self):
+        # An email present but NO administrator role anywhere -> nothing, so we
+        # never attribute a court/debtor address as administrator contact.
+        text = "Allgemeine Mitteilung des Gerichts. E-Mail: poststelle@ag.example.de"
+        r = parse_insolvency_admin(text)
+        self.assertEqual(
+            r, {"name": None, "firm": None, "address": None, "phone": None, "email": None}
+        )
+
+    def test_address_never_returned_without_name(self):
+        # A PLZ/street is present but no name anchor -> address must stay None
+        # (could be the debtor's address); only labelled email/phone are safe.
+        text = (
+            "Sicherungsmaßnahmen werden angeordnet. Vorläufiger "
+            "Insolvenzverwalter erreichbar Tel.: 089 12345. Schuldner wohnhaft "
+            "Beispielweg 4, 80331 München."
+        )
+        r = parse_insolvency_admin(text)
+        self.assertIsNone(r["address"])
+        self.assertEqual(r["phone"], "089 12345")
+
+
+class TestAdminMapping(unittest.TestCase):
+    """Phase 0044: the five admin fields flow through extract_fields_from_text
+    and InsolvencyRecord.to_db_dict (previously firm/address/phone/email were
+    dropped before persistence)."""
+
+    FULL = (
+        "Insolvenzverwalter ist: Rechtsanwalt Thomas Wilhelm, Jost Nowak "
+        "Rechtsanwälte, Homburger Landstr. 838, 60437 Frankfurt am Main, "
+        "Tel.: 069-209 739 0, E-Mail: wilhelm@jruc.de. Die Gläubiger werden "
+        "aufgefordert:"
+    )
+
+    def test_extract_fields_returns_all_five(self):
+        f = extract_fields_from_text(self.FULL)
+        self.assertEqual(f["insolvency_administrator"], "Rechtsanwalt Thomas Wilhelm")
+        self.assertEqual(f["insolvency_admin_firm"], "Jost Nowak Rechtsanwälte")
+        self.assertEqual(f["insolvency_admin_address"],
+                         "Homburger Landstr. 838, 60437 Frankfurt am Main")
+        self.assertEqual(f["insolvency_admin_phone"], "069-209 739 0")
+        self.assertEqual(f["insolvency_admin_email"], "wilhelm@jruc.de")
+
+    def test_to_db_dict_includes_subfields(self):
+        f = extract_fields_from_text(self.FULL)
+        r = InsolvencyRecord(court="AG Frankfurt", case_number="1 IN 2/26",
+                             announcement_date="2026-01-01")
+        r.insolvency_administrator = f["insolvency_administrator"]
+        r.insolvency_admin_firm = f["insolvency_admin_firm"]
+        r.insolvency_admin_address = f["insolvency_admin_address"]
+        r.insolvency_admin_phone = f["insolvency_admin_phone"]
+        r.insolvency_admin_email = f["insolvency_admin_email"]
+        d = r.to_db_dict()
+        self.assertEqual(d["insolvency_admin_firm"], "Jost Nowak Rechtsanwälte")
+        self.assertEqual(d["insolvency_admin_address"],
+                         "Homburger Landstr. 838, 60437 Frankfurt am Main")
+        self.assertEqual(d["insolvency_admin_phone"], "069-209 739 0")
+        self.assertEqual(d["insolvency_admin_email"], "wilhelm@jruc.de")
 
 
 if __name__ == "__main__":
