@@ -72,6 +72,22 @@ jobs:
         run: |
           python scraper.py
 
+      # After the backlog drain succeeds, copy/link the freshly text-filled
+      # neu_insolvenz_direct rows into the Swift V2 entity architecture via
+      #   swift_v2.backfill_neu_insolvenz_direct_entities(null)
+      # Mirrors the identical step in daily-scrape.yml. Without this, text
+      # fetched here lands only in public.apify_cases and lags swift_v2 until
+      # the next daily-scrape run (Phase 0037G sync gap). Same env/secrets as
+      # the scraper step above. Gated on scraper success so a failed drain does
+      # not trigger a partial sync.
+      - name: Run Swift V2 entity backfill
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python scripts/run_swift_v2_backfill.py
+
       - name: Notify on failure
         if: failure()
         continue-on-error: true
