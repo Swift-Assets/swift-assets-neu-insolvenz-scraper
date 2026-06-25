@@ -79,6 +79,7 @@ class _WorkerPoolTestBase(unittest.TestCase):
                 "opening_date": None,
                 "claims_deadline": None,
                 "announcement_type_hint": None,
+                "announcement_type_raw": None,
                 "insolvency_phase": None,
                 "is_pre_verteilung": None,
             },
