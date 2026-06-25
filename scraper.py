@@ -364,6 +364,19 @@ TYPE_KEYWORDS: list[tuple[str, str]] = [
     # Appointment (lowest priority — most openings also mention it)
     ("bestellung", "Bestellung"),
     ("bestellt", "Bestellung"),
+    # ---- Phase 0037F-A extension: small high-confidence gaps ---------------
+    # Appended at the LOWEST priority so existing classifications can NEVER
+    # change (these fire only when no keyword above matched). All are late-stage
+    # / administrative announcement types — conservatively surfaced as 'monitor'
+    # in the cockpit (swift_v2.fn_cockpit_phase_*), never pre-Verteilung. Generic
+    # "Beschluss"/"Termin" are deliberately NOT added (ambiguous → keep NULL).
+    ("insolvenzplan", "Insolvenzplan"),
+    ("schlussrechnung", "Schlussrechnung"),
+    ("glaeubigerversammlung", "Gläubigerversammlung"),
+    ("glaeubigerausschuss", "Gläubigerversammlung"),
+    ("treuhaender", "Treuhänder"),
+    ("verfahrenskostenstundung", "Verfahrenskostenstundung"),
+    ("stundung", "Verfahrenskostenstundung"),
 ]
 
 

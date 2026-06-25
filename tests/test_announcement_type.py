@@ -57,6 +57,41 @@ class TestAnnouncementTypeCategories(unittest.TestCase):
                 self.assertEqual(detect_announcement_type(text), expected)
 
 
+class TestPhase0037FAExtension(unittest.TestCase):
+    """Phase 0037F-A small high-confidence gap keywords. All appended at lowest
+    priority, so they must NEVER override an existing higher-priority type."""
+
+    EXT_CASES = [
+        ("Der Insolvenzplan wird zur Einsicht niedergelegt.", "Insolvenzplan"),
+        ("Die Schlussrechnung des Insolvenzverwalters liegt vor.", "Schlussrechnung"),
+        ("Termin zur Gläubigerversammlung wird bestimmt.", "Gläubigerversammlung"),
+        ("Es wird ein Gläubigerausschuss bestellt.", "Bestellung"),  # 'bestellt' wins (higher prio)
+        ("Einsetzung eines Glaeubigerausschusses.", "Gläubigerversammlung"),
+        ("Zum Treuhänder wird eine Person bestimmt.", "Treuhänder"),
+        ("Verfahrenskostenstundung wird bewilligt.", "Verfahrenskostenstundung"),
+        ("Die Stundung der Verfahrenskosten wird angeordnet.", "Anordnung"),  # 'angeordnet' wins
+    ]
+
+    def test_extension_keywords(self):
+        for text, expected in self.EXT_CASES:
+            with self.subTest(expected=expected):
+                self.assertEqual(detect_announcement_type(text), expected)
+
+    def test_extension_never_overrides_existing(self):
+        # A text with both a high-priority type and an extension keyword must
+        # resolve to the high-priority type (extension is lowest priority).
+        self.assertEqual(
+            detect_announcement_type(
+                "Eröffnung des Insolvenzverfahrens. Gläubigerversammlung anberaumt."),
+            "Eröffnung",
+        )
+
+    def test_extension_umlaut_folding(self):
+        self.assertEqual(detect_announcement_type("Glaeubigerversammlung"),
+                         detect_announcement_type("Gläubigerversammlung"))
+        self.assertEqual(detect_announcement_type("Treuhaender"), "Treuhänder")
+
+
 class TestUmlautNormalization(unittest.TestCase):
     """ae/oe/ue/ss spellings must resolve to the same canonical label as the
     umlaut spellings — the core Phase 0037D fix."""
