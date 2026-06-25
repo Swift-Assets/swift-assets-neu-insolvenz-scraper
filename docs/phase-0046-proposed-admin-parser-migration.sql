@@ -1,9 +1,26 @@
 -- =============================================================================
--- PHASE 0046 — PROPOSED migration (DO NOT APPLY without explicit approval)
+-- PHASE 0046 — admin-parser stop-set expansion (APPLIED in Phase 0046-B1)
 -- =============================================================================
+-- Status: APPLIED to project hqyktreytsjeirlpnnyr via migrations
+-- phase_0046_b1_admin_parser_stop_expansion + phase_0046_b1_fix_postgres_greediness.
+-- This file is the HISTORY/record of the live function (kept in sync with prod).
+-- It carries NO raw data, performs NO overwrite, and the NULL-only backfill that
+-- accompanies it (section 2) is approval-gated (Phase 0046-B2).
+--
 -- Mirrors the Phase 0046 Python fix in scraper.parse_insolvency_admin into the
 -- DB parser swift_v2.fn_parse_insolvency_admin (which fills the Cockpit-facing
 -- swift admin columns via the COALESCE-only trigger trg_fill_insolvency_admin).
+--
+-- POSTGRES-SPECIFIC FIX (Phase 0046-B1): applying the first draft of this
+-- function still returned name-only / "{}" because PostgreSQL ties the WHOLE
+-- regex's greediness to its FIRST quantifier (unlike Python, which evaluates
+-- each quantifier independently). The greedy leading groups + connector
+-- quantifier forced the (.{3,255}?) capture to run to end-of-text, overshooting
+-- the PLZ. The leading optional groups and the connector run are therefore made
+-- NON-GREEDY here: (?:zum |zur |zu )??, (?:vorl[äa]ufige[rn]? )??, {1,5}?.
+-- This makes the whole RE non-greedy so the capture stops at the FIRST stop
+-- token. The connector remnant ("bestellt: ", "ist:") is stripped by the
+-- head-junk regex. (The Python parser does NOT need this — its engine differs.)
 --
 -- ROOT CAUSE (read-only diagnosis):
 --   The trigger regex REQUIRES a trailing stop token after the captured name/
@@ -71,9 +88,12 @@ BEGIN
     v_contact := '{}'::jsonb;
   END IF;
 
+  -- Leading optional groups + connector run are NON-GREEDY (??, {1,5}?) so the
+  -- whole RE is non-greedy and (.{3,255}?) stops at the FIRST stop token — see
+  -- the POSTGRES-SPECIFIC FIX note in the header.
   cand := (regexp_match(t,
-    '(?i)(?:zum |zur |zu )?(?:vorl[äa]ufige[rn]? )?(?:Insolvenzverwalter(?:in)?|Sachwalter(?:in)?|Treuh[äa]nder(?:in)?) '
-    || '(?:(?:ist|wird|hiermit|bestellt|bestimmt|ernannt|worden|zum|zur)[\s:]+){1,5}(.{3,255}?)' || stop_re))[1];
+    '(?i)(?:zum |zur |zu )??(?:vorl[äa]ufige[rn]? )??(?:Insolvenzverwalter(?:in)?|Sachwalter(?:in)?|Treuh[äa]nder(?:in)?) '
+    || '(?:(?:ist|wird|hiermit|bestellt|bestimmt|ernannt|worden|zum|zur)[\s:]+){1,5}?(.{3,255}?)' || stop_re))[1];
   IF cand IS NULL THEN RETURN v_contact; END IF;
   cand := btrim(regexp_replace(cand, '(?i)^(?:bestellt|bestimmt|ernannt|worden|zum|zur|ist|wird|hiermit|den|der|die|[:,]|\s)+', ''));
 
