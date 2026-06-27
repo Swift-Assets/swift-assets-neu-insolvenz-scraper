@@ -159,7 +159,8 @@ def serpapi_links(query: str, key: str) -> list[str]:
     return firm_links[:3]
 
 
-def pick_email(emails: list[str], firm_host: str, surname: str) -> Optional[str]:
+def pick_email(emails: list[str], firm_host: str, surname: str,
+               page_has_surname: bool) -> Optional[str]:
     firm_reg = registrable(firm_host)
     cands = []
     for e in emails:
@@ -174,12 +175,17 @@ def pick_email(emails: list[str], firm_host: str, surname: str) -> Optional[str]
         cands.append(e.lower())
     if not cands:
         return None
-    # Prefer surname in local-part, then kanzlei/info, else first.
+    # A surname-matched local-part is self-verifying (e.g. casper@firma.de).
     sn = surname.lower()
     for e in cands:
         if sn and sn in e.split("@")[0]:
             return e
-    for pref in ("kanzlei", "info", "mail", "kontakt", "inso"):
+    # A generic address (kanzlei@/info@/…) is only accepted when the fetched
+    # page actually names this administrator — otherwise it is a different firm
+    # that merely ranked in the search results (false-positive guard).
+    if not page_has_surname:
+        return None
+    for pref in ("kanzlei", "info", "mail", "kontakt", "inso", "office"):
         for e in cands:
             if e.split("@")[0].startswith(pref):
                 return e
@@ -202,8 +208,9 @@ def find_email(name: str, city: str, key: str, pause: float) -> Optional[tuple[s
             status, html = http_get(firm + path)
             if status != 200 or not html:
                 continue
+            page_has_surname = bool(surname) and surname.lower() in html.lower()
             emails = EMAIL_RE.findall(html)
-            chosen = pick_email(emails, firm_host, surname)
+            chosen = pick_email(emails, firm_host, surname, page_has_surname)
             if chosen:
                 return chosen, firm_host
             time.sleep(pause)
