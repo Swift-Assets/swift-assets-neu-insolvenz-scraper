@@ -29,7 +29,10 @@ Environment
 * ``SUPABASE_SERVICE_ROLE_KEY``  — required
 * ``SERPAPI_KEY``                — required (same key the old edge fn used)
 * ``MAX_ADMINS``                 — optional int, default 300
-* ``REQUEST_PAUSE_SECONDS``      — optional float, default 1.0 (politeness)
+* ``REQUEST_PAUSE_SECONDS``      — optional float, default 0.5 (politeness)
+* ``PROPAGATE_EVERY``            — optional int, default 40 (flush cadence)
+* ``TIME_BUDGET_SECONDS``        — optional float, default 3300 (stop before the
+                                   60-min job timeout so the final flush runs)
 * ``DRY_RUN``                    — optional, ``1`` = search but do not write
 
 Exit codes: 0 ok · 2 config error · 3 fatal transport error.
@@ -71,8 +74,7 @@ LAWFIRM_TOKENS = ("recht", "kanzlei", "anwalt", "anwae", "anwä", "legal",
 
 def is_lawfirm_domain(reg: str) -> bool:
     return any(tok in reg for tok in LAWFIRM_TOKENS)
-IMPRESSUM_PATHS = ["", "/impressum", "/kontakt", "/impressum.html",
-                   "/kontakt.html", "/impressum/", "/kontakt/"]
+IMPRESSUM_PATHS = ["", "/impressum", "/kontakt", "/impressum.html", "/kontakt.html"]
 # German words that the upstream parser sometimes leaves where a surname should
 # be — never treat these as an administrator surname (false-positive guard).
 COMMON_WORDS = {
@@ -101,7 +103,7 @@ def need(name: str) -> str:
     return v
 
 
-def http_get(url: str, timeout: int = 20) -> tuple[int, str]:
+def http_get(url: str, timeout: int = 12) -> tuple[int, str]:
     req = request.Request(url, headers={
         "User-Agent": "SwiftAssets-AdminEnrich/1.0 (+https://swift-assets.de)",
         "Accept": "text/html,application/json",
@@ -188,7 +190,7 @@ def serpapi_search(query: str, key: str) -> tuple[list[str], str]:
             continue
         seen.add(reg)
         firm_links.append(f"{parse.urlsplit(u).scheme or 'https'}://{h}")
-    return firm_links[:3], deobfuscate(" ".join(snippets))
+    return firm_links[:2], deobfuscate(" ".join(snippets))
 
 
 def pick_email(emails: list[str], firm_host: str, surname: str,
@@ -276,8 +278,21 @@ def main() -> int:
     skey = need("SUPABASE_SERVICE_ROLE_KEY")
     serp = need("SERPAPI_KEY")
     max_admins = int(os.environ.get("MAX_ADMINS", "300"))
-    pause = float(os.environ.get("REQUEST_PAUSE_SECONDS", "1.0"))
+    pause = float(os.environ.get("REQUEST_PAUSE_SECONDS", "0.5"))
     dry = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
+    propagate_every = int(os.environ.get("PROPAGATE_EVERY", "40"))
+    # Stop a little before the job's 60-min timeout so the final propagate runs.
+    time_budget = float(os.environ.get("TIME_BUDGET_SECONDS", "3300"))
+    start = time.monotonic()
+
+    def propagate(tag: str) -> None:
+        if dry:
+            return
+        try:
+            res = postgrest("POST", "rpc/fn_propagate_admin_contact", base, skey, {})
+            print(f"[propagate:{tag}] {res}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[propagate:{tag}] failed: {e}", file=sys.stderr)
 
     try:
         worklist = postgrest(
@@ -291,7 +306,12 @@ def main() -> int:
     total = len(worklist or [])
     print(f"[start] {total} administrators to enrich (dry_run={dry})")
     found = written = 0
+    stopped_early = False
     for i, row in enumerate(worklist or [], 1):
+        if time.monotonic() - start > time_budget:
+            print(f"[stop] time budget reached after {i - 1} administrators")
+            stopped_early = True
+            break
         name = (row.get("name") or "").strip()
         city = (row.get("city") or "").strip()
         if not city and row.get("address"):
@@ -317,17 +337,15 @@ def main() -> int:
                 "p_norm_name": row["norm_name"], "p_email": email, "p_firm": None})
             written += 1
             print(f"[{i}/{total}] {name!r} -> {email}  (src {src}, rows {n})")
+            # Flush periodically so an interrupted run still reaches the cockpit.
+            if written % propagate_every == 0:
+                propagate(f"batch@{written}")
         except Exception as e:  # noqa: BLE001
             print(f"[{i}/{total}] {name!r} -> {email}  WRITE FAILED: {e}")
 
-    if not dry:
-        try:
-            res = postgrest("POST", "rpc/fn_propagate_admin_contact", base, skey, {})
-            print(f"[propagate] {res}")
-        except Exception as e:  # noqa: BLE001
-            print(f"[propagate] failed: {e}", file=sys.stderr)
-
-    print(f"[done] found={found} written={written} of {total}")
+    propagate("final")
+    print(f"[done] found={found} written={written} of {total} "
+          f"(stopped_early={stopped_early})")
     return 0
 
 
