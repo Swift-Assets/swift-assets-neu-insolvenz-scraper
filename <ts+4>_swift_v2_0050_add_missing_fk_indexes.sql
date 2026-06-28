@@ -1,0 +1,10 @@
+create index if not exists idx_cockpit_outreach_drafts_created_by on swift_v2.cockpit_outreach_drafts (created_by);
+create index if not exists idx_cockpit_outreach_drafts_updated_by on swift_v2.cockpit_outreach_drafts (updated_by);
+create index if not exists idx_cockpit_outreach_events_actor on swift_v2.cockpit_outreach_events (actor_id);
+create index if not exists idx_cockpit_task_events_actor on swift_v2.cockpit_task_events (actor_id);
+create index if not exists idx_cockpit_tasks_created_by on swift_v2.cockpit_tasks (created_by);
+create index if not exists idx_cockpit_user_profiles_created_by on swift_v2.cockpit_user_profiles (created_by);
+create index if not exists idx_entity_match_candidates_candidate_entity on swift_v2.entity_match_candidates (candidate_entity_id);
+create index if not exists idx_entity_match_candidates_proposed_entity on swift_v2.entity_match_candidates (proposed_entity_id);
+create index if not exists idx_insolvency_admin_mentions_announcement on swift_v2.insolvency_administrator_mentions (announcement_id);
+create index if not exists idx_source_hr_records_entity on swift_v2.source_handelsregister_records (entity_id);

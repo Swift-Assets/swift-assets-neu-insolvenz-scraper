@@ -1,0 +1,15 @@
+ALTER FUNCTION swift_v2.classify_subject_type(p_name text, p_case_number text, p_registry_type text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.detect_legal_form(p_name text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.entity_retention_until(p_entity_type text, p_last_seen_at timestamp with time zone) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.fn_classify_insolvency_phase_from_text(p_text text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.fn_parse_insolvency_admin(p_text text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.insolvency_case_key(p_court text, p_case_number text, p_announcement_date date, p_announcement_type_hint text, p_registry_court text, p_registry_type text, p_registry_number text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.norm_key_part(p_text text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.norm_registry_number(p_number text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.norm_registry_type(p_type text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.norm_text(p_text text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.normalize_court_name(raw text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.registry_identity_key(p_registry_court text, p_registry_type text, p_registry_number text) SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.set_updated_at() SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.tg_fill_insolvency_admin() SET search_path = swift_v2, public, pg_temp;
+ALTER FUNCTION swift_v2.tg_hr_set_registry_identity_key() SET search_path = swift_v2, public, pg_temp;
