@@ -64,6 +64,13 @@ DIRECTORY_DOMAINS = {
 # Local-parts that are noise even on the right domain.
 BAD_LOCALPARTS = {"datenschutz", "noreply", "no-reply", "webmaster", "abuse",
                   "newsletter", "presse", "marketing"}
+# Tokens that mark a domain as an actual law firm (used to gate generic e-mails).
+LAWFIRM_TOKENS = ("recht", "kanzlei", "anwalt", "anwae", "anwä", "legal",
+                  "insolv", "partner", "advo", "jura", "jur-", "law")
+
+
+def is_lawfirm_domain(reg: str) -> bool:
+    return any(tok in reg for tok in LAWFIRM_TOKENS)
 IMPRESSUM_PATHS = ["", "/impressum", "/kontakt", "/impressum.html",
                    "/kontakt.html", "/impressum/", "/kontakt/"]
 # German words that the upstream parser sometimes leaves where a surname should
@@ -205,10 +212,12 @@ def pick_email(emails: list[str], firm_host: str, surname: str,
     for e in cands:
         if sn and sn in e.split("@")[0]:
             return e
-    # A generic address (kanzlei@/info@/…) is only accepted when the fetched
-    # page actually names this administrator — otherwise it is a different firm
-    # that merely ranked in the search results (false-positive guard).
-    if not page_has_surname:
+    # A generic address (kanzlei@/info@/…) is only accepted when the fetched page
+    # names this administrator AND the domain looks like a law firm (or carries
+    # the surname). This rejects unrelated sites — e.g. a newspaper that happens
+    # to mention a common surname like "Fischer".
+    sn_in_dom = bool(sn) and len(sn) >= 4 and sn in firm_reg.replace("-", "")
+    if not (page_has_surname and (is_lawfirm_domain(firm_reg) or sn_in_dom)):
         return None
     for pref in ("kanzlei", "info", "mail", "kontakt", "inso", "office"):
         for e in cands:
