@@ -66,6 +66,24 @@ BAD_LOCALPARTS = {"datenschutz", "noreply", "no-reply", "webmaster", "abuse",
                   "newsletter", "presse", "marketing"}
 IMPRESSUM_PATHS = ["", "/impressum", "/kontakt", "/impressum.html",
                    "/kontakt.html", "/impressum/", "/kontakt/"]
+# German words that the upstream parser sometimes leaves where a surname should
+# be — never treat these as an administrator surname (false-positive guard).
+COMMON_WORDS = {
+    "einsicht", "akteneinsicht", "einsichtnahme", "insolvenzverwalter",
+    "insolvenzverwalterin", "rechtsanwalt", "rechtsanwältin", "kanzlei",
+    "verwalter", "verwalterin", "gericht", "amtsgericht", "insolvenz",
+    "verfahren", "schuldner", "gläubiger", "glaeubiger", "masse", "termin",
+    "bericht", "antrag", "beschluss", "eröffnung", "eroeffnung", "postanschrift",
+    "geschäftsstelle", "geschaeftsstelle", "sachverständiger", "treuhänder",
+}
+
+
+def deobfuscate(t: str) -> str:
+    """Normalise common German e-mail obfuscation: name(at)firma(punkt)de."""
+    t = re.sub(r"\s*[\(\[\{]\s*(?:at|ät)\s*[\)\]\}]\s*", "@", t, flags=re.I)
+    t = re.sub(r"&#0*64;", "@", t)
+    t = re.sub(r"\s*[\(\[\{]\s*(?:punkt|dot)\s*[\)\]\}]\s*", ".", t, flags=re.I)
+    return t
 
 
 def need(name: str) -> str:
@@ -125,25 +143,32 @@ def is_directory(host: str) -> bool:
                for d in DIRECTORY_DOMAINS)
 
 
-def serpapi_links(query: str, key: str) -> list[str]:
+def serpapi_search(query: str, key: str) -> tuple[list[str], str]:
+    """Return (firm_site_urls, snippet_blob) for a query."""
     params = parse.urlencode({
         "engine": "google", "q": query, "api_key": key,
         "num": "6", "hl": "de", "gl": "de", "google_domain": "google.de",
     })
     status, raw = http_get(f"https://serpapi.com/search.json?{params}")
     if status != 200 or not raw:
-        return []
+        return [], ""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return []
+        return [], ""
     links: list[str] = []
+    snippets: list[str] = []
     kg = data.get("knowledge_graph") or {}
     if kg.get("website"):
         links.append(kg["website"])
+    if kg.get("description"):
+        snippets.append(kg["description"])
     for r in (data.get("organic_results") or []):
         if r.get("link"):
             links.append(r["link"])
+        for f in ("title", "snippet"):
+            if r.get(f):
+                snippets.append(r[f])
     # Keep only plausible firm sites, in result order, de-duped by domain.
     seen: set[str] = set()
     firm_links: list[str] = []
@@ -156,7 +181,7 @@ def serpapi_links(query: str, key: str) -> list[str]:
             continue
         seen.add(reg)
         firm_links.append(f"{parse.urlsplit(u).scheme or 'https'}://{h}")
-    return firm_links[:3]
+    return firm_links[:3], deobfuscate(" ".join(snippets))
 
 
 def pick_email(emails: list[str], firm_host: str, surname: str,
@@ -193,21 +218,39 @@ def pick_email(emails: list[str], firm_host: str, surname: str,
 
 
 def surname_of(name: str) -> str:
-    cleaned = re.sub(r"\b(Rechtsanw[aä]lt(in)?|Prof\.?|Dr\.?|LL\.M\.?|"
-                     r"Fachanwalt|Dipl\.?-?\w*|Notar(in)?)\b", " ", name, flags=re.I)
-    toks = [t for t in re.split(r"[\s,]+", cleaned) if len(t) > 1 and any(c.isalpha() for c in t)]
-    return toks[-1] if toks else ""
+    cleaned = name.replace("\r", " ").replace("\n", " ")
+    cleaned = re.sub(r"\b(Rechtsanw[aä]lt(in)?|Prof\.?|Dr\.?|LL\.M\.?|Fachanwalt|"
+                     r"Dipl\.?-?\w*|Diplom-?\w*|Wirtschaftsjurist(in)?|Notar(in)?|"
+                     r"Herr|Frau)\b", " ", cleaned, flags=re.I)
+    # Plausible surname: >=4 letters, no digits, not a stray common word.
+    toks = [t for t in re.split(r"[\s,]+", cleaned)
+            if len(t) >= 4 and any(c.isalpha() for c in t)
+            and not any(c.isdigit() for c in t)]
+    for t in reversed(toks):
+        if t.lower() not in COMMON_WORDS:
+            return t
+    return ""
 
 
 def find_email(name: str, city: str, key: str, pause: float) -> Optional[tuple[str, str]]:
     surname = surname_of(name)
     query = f'"{name}" Insolvenzverwalter {city} Kanzlei E-Mail Impressum'.strip()
-    for firm in serpapi_links(query, key):
+    firm_links, snippet_blob = serpapi_search(query, key)
+    # 1) A surname-matched e-mail visible in the search snippets is self-verifying.
+    if surname:
+        for e in EMAIL_RE.findall(snippet_blob):
+            local, _, dom = e.lower().partition("@")
+            if (dom and not is_directory(dom) and local not in BAD_LOCALPARTS
+                    and surname.lower() in local):
+                return e.lower(), dom
+    # 2) Fetch each firm's Impressum/Kontakt and extract (after de-obfuscation).
+    for firm in firm_links:
         firm_host = host_of(firm)
         for path in IMPRESSUM_PATHS:
             status, html = http_get(firm + path)
             if status != 200 or not html:
                 continue
+            html = deobfuscate(html)
             page_has_surname = bool(surname) and surname.lower() in html.lower()
             emails = EMAIL_RE.findall(html)
             chosen = pick_email(emails, firm_host, surname, page_has_surname)
@@ -215,6 +258,7 @@ def find_email(name: str, city: str, key: str, pause: float) -> Optional[tuple[s
                 return chosen, firm_host
             time.sleep(pause)
         time.sleep(pause)
+    return None
     return None
 
 
