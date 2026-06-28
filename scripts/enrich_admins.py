@@ -57,6 +57,8 @@ DIRECTORY_DOMAINS = {
     "11880.com", "dastelefonbuch.de", "personensuche.dastelefonbuch.de",
     "yasni.de", "linkedin.com", "de.linkedin.com", "facebook.com", "xing.com",
     "kununu.com", "anwalt.de", "anwalt-suchservice.de", "rechtecheck.de",
+    "fachanwalt.de", "anwalt24.de", "juraforum.de", "123recht.de",
+    "advocado.de", "anwaltyt405.de", "rechtsanwalt.com", "jurato.de",
     "northdata.com", "north-data.com", "openpr.de", "google.com",
     "wikipedia.org", "versteigerungskalender.de", "insolvenz-radar.de",
     "diebewertung.de", "der-indat.de", "rws-verlag.de", "lehmanns.de",
