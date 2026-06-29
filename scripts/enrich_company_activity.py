@@ -9,22 +9,28 @@ German (``activity_de``) and faithfully translated to Arabic (``activity_ar``).
 
 Pipeline (validated by the spikes — see PR description)
 -------------------------------------------------------
-PASS 1  (cheap, ~2 credits/company)
-    Firecrawl **SEARCH** ``"<name> <city> Handelsregister"`` and read only the
-    result *snippets* (title + description). Parse a ``Gegenstand`` text and any
-    registry token (HRB/HRA/VR/… + number) and court visible in the snippets.
+PASS 1  (cheap, ~2 credits per query)
+    Firecrawl **SEARCH** a small set of query variants — ``"<name> <city>
+    Handelsregister"``, ``"<name> <city> <TYPE>"``, ``"<name> <city>
+    Gegenstand"``, ``"<name> <TYPE> <number>"`` — stopping at the first variant
+    whose snippets yield an identity match. Reads only the result *snippets*
+    (title + description); parses a ``Gegenstand`` text and any registry token
+    (HRB/HRA/VR/… + number) and court visible in the snippets.
 
 STRICT MATCH GATE  (mandatory — zero false accepts over 42 spike companies)
     Accept a purpose ONLY if a snippet's registry number matches the company's
     ``registry_number`` (type-aware) AND, *when a court is also visible in that
     snippet*, the court matches ``registry_court``. No match → reject. We never
-    display a guessed / foreign same-name company.
+    display a guessed / foreign same-name company. This gate is unchanged.
 
 PASS 2  (only when identity matched but the snippet purpose is missing/truncated)
-    Firecrawl **SCRAPE** the single matched entity page on
-    ``unternehmensregister.de`` ONLY (official, free) to recover the full
-    Gegenstand. We never scrape commercial aggregators (North Data / Creditreform
-    / …) and never scrape ``handelsregister.de``. No Stealth mode.
+    Firecrawl **SCRAPE** the SINGLE identity-matched result whose host is on the
+    least-risk allow-list, tried in this order:
+    ``unternehmensregister.de`` (official) > ``handelsregister.ai`` >
+    ``insolvenz-radar.de`` > ``viaductus.de`` > ``firmeneintrag.creditreform.de``
+    > ``northdata.de`` / ``.com``. We re-verify the matching HRB on the scraped
+    page before trusting it, never scrape a page that wasn't identity-matched,
+    and never scrape ``handelsregister.de``. One page per company, no Stealth.
 
 TRANSLATE
     GPT-4o-mini condenses the German purpose to 1–2 sentences (``activity_de``)
@@ -36,8 +42,9 @@ Write
 Idempotent UPSERT into ``swift_v2.company_activity_sources`` on
 ``(entity_id, source)`` where
 
-* ``source`` = ``'unternehmensregister'`` when a pass-2 scrape supplied the
-  purpose, else ``'aggregator'`` (snippet-derived).
+* ``source`` = the domain class of the page that supplied the purpose:
+  ``'unternehmensregister'`` for ``unternehmensregister.de``, else
+  ``'aggregator'`` (any other allow-listed host, or a snippet-derived purpose).
 * ``confidence`` = ``'high'`` when registry number **and** court both matched,
   else ``'medium'``.
 * ``source_ref`` = the matched URL, or ``"<TYPE> <n> / <court>"`` when only the
@@ -84,8 +91,26 @@ SCHEMA = "swift_v2"
 ACTIVITY_TABLE = "company_activity_sources"
 SOURCE_VIEW = "source_neu_insolvenz_announcements"
 
-# unternehmensregister.de is the ONLY host we are allowed to SCRAPE in pass 2.
+# unternehmensregister.de is the official, free registry portal. It stays the
+# preferred pass-2 scrape target and drives source='unternehmensregister'.
 UNTERNEHMENSREGISTER_HOST = "unternehmensregister.de"
+
+# handelsregister.de must NEVER be scraped (ToS / heavy session handling).
+HANDELSREGISTER_HOST = "handelsregister.de"
+
+# PASS 2 scrape allow-list, in LEAST-RISK order (index = priority, lower first).
+# We scrape the SINGLE identity-matched result with the best rank here; a host
+# not in this tuple (or handelsregister.de) is never scraped. unternehmensregister
+# stays first/preferred; the rest are aggregators tried only as a fallback.
+SCRAPE_DOMAIN_ORDER = (
+    "unternehmensregister.de",
+    "handelsregister.ai",
+    "insolvenz-radar.de",
+    "viaductus.de",
+    "firmeneintrag.creditreform.de",
+    "northdata.de",
+    "northdata.com",
+)
 
 # Registry tokens as they appear in German registers / snippets.
 REG_TOKEN_RE = re.compile(
@@ -123,9 +148,39 @@ def host_of(url: str) -> str:
         return ""
 
 
+def host_matches(host: str, domain: str) -> bool:
+    """True when *host* equals *domain* or is a sub-domain of it."""
+    return host == domain or host.endswith("." + domain)
+
+
 def is_unternehmensregister(url: str) -> bool:
+    return host_matches(host_of(url), UNTERNEHMENSREGISTER_HOST)
+
+
+def is_handelsregister_de(url: str) -> bool:
+    """handelsregister.de — explicitly never scraped, regardless of allow-list."""
+    return host_matches(host_of(url), HANDELSREGISTER_HOST)
+
+
+def scrape_rank(url: str) -> Optional[int]:
+    """Pass-2 scrape priority for *url*.
+
+    Returns the index of the matching host in :data:`SCRAPE_DOMAIN_ORDER`
+    (lower = preferred / least-risk), or ``None`` when the host is not on the
+    allow-list. ``handelsregister.de`` is always refused (``None``).
+    """
     h = host_of(url)
-    return h == UNTERNEHMENSREGISTER_HOST or h.endswith("." + UNTERNEHMENSREGISTER_HOST)
+    if not h or host_matches(h, HANDELSREGISTER_HOST):
+        return None
+    for i, dom in enumerate(SCRAPE_DOMAIN_ORDER):
+        if host_matches(h, dom):
+            return i
+    return None
+
+
+def source_class(url: str) -> str:
+    """Domain class stored in ``source``: official portal vs. aggregator."""
+    return "unternehmensregister" if is_unternehmensregister(url) else "aggregator"
 
 
 def http_json(method: str, url: str, headers: dict[str, str],
@@ -285,10 +340,14 @@ def firecrawl_search(query: str, key: str, limit: int = 5) -> list[dict[str, str
     return out
 
 
-def firecrawl_scrape_unternehmensregister(url: str, key: str) -> str:
-    """Pass 2: scrape ONE unternehmensregister.de page; returns markdown text."""
-    if not is_unternehmensregister(url):
-        raise ValueError(f"refusing to scrape non-unternehmensregister host: {url}")
+def firecrawl_scrape(url: str, key: str) -> str:
+    """Pass 2: scrape ONE allow-listed page; returns markdown text.
+
+    Only hosts on :data:`SCRAPE_DOMAIN_ORDER` are scraped; handelsregister.de
+    and any other host are refused. One page per call (no Stealth, no retries).
+    """
+    if scrape_rank(url) is None:
+        raise ValueError(f"refusing to scrape disallowed host: {url}")
     status, payload = http_json(
         "POST", "https://api.firecrawl.dev/v1/scrape",
         {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -338,7 +397,8 @@ def openai_translate(purpose_de: str, key: str) -> tuple[str, str]:
 class Decision:
     __slots__ = ("entity_id", "name", "accepted", "reason", "source",
                  "confidence", "source_ref", "matched_hrb", "purpose_de",
-                 "purpose_ar", "purpose_raw", "credits")
+                 "purpose_ar", "purpose_raw", "credits", "matched_variant",
+                 "pass_used", "court_matched")
 
     def __init__(self, entity_id: str, name: str) -> None:
         self.entity_id = entity_id
@@ -353,6 +413,32 @@ class Decision:
         self.purpose_ar = ""
         self.purpose_raw = ""
         self.credits = 0
+        self.matched_variant = ""   # which pass-1 query produced the identity match
+        self.pass_used = ""         # "1" (snippet) or "2" (scrape)
+        self.court_matched = False  # registry court matched on the source page
+
+
+def build_query_variants(name: str, city: str, reg_type: str,
+                         reg_num: str) -> list[str]:
+    """Small set of pass-1 search phrasings, tried in order until one matches.
+
+    Broadens recall over the original single ``"<name> <city> Handelsregister"``
+    query (which missed companies whose HRB-bearing snippet only surfaced under a
+    different phrasing). De-duplicated; whitespace-collapsed.
+    """
+    rt = (reg_type or "HRB").strip()
+    variants: list[str] = []
+
+    def add(q: str) -> None:
+        q = " ".join(q.split())
+        if q and q not in variants:
+            variants.append(q)
+
+    add(f"{name} {city} Handelsregister")
+    add(f"{name} {city} {rt}")
+    add(f"{name} {city} Gegenstand")
+    add(f"{name} {rt} {reg_num}")
+    return variants
 
 
 def process_company(co: dict[str, Any], *,
@@ -376,63 +462,84 @@ def process_company(co: dict[str, Any], *,
         d.reason = "missing name/registry_number/registry_court"
         return d
 
-    query = f"{name} {city} Handelsregister".strip()
-    results = search_fn(query)
-    d.credits += 2  # a Firecrawl search is ~2 credits
-
-    # --- gate over snippets; remember the best matching snippet + a scrape URL.
-    matched = False
-    court_matched = False
-    snippet_purpose: Optional[str] = None
-    matched_url = ""
-    ur_scrape_url = ""  # unternehmensregister.de URL whose snippet matched
-    for r in results:
-        blob = f"{r.get('title','')} {r.get('description','')}"
-        ok, court_ok = identity_match(blob, reg_type, reg_num, reg_court)
-        if not ok:
-            continue
-        matched = True
-        court_matched = court_matched or court_ok
-        if not matched_url:
-            matched_url = r.get("url") or ""
-        cand_purpose = extract_gegenstand(blob)
-        if cand_purpose and (snippet_purpose is None or
-                             len(cand_purpose) > len(snippet_purpose)):
-            snippet_purpose = cand_purpose
-        if is_unternehmensregister(r.get("url") or "") and not ur_scrape_url:
-            ur_scrape_url = r.get("url") or ""
+    # --- PASS 1: try query variants, stop at the first that yields an identity
+    #     match. The strict gate (identity_match) is UNCHANGED.
+    matched: list[tuple[dict[str, str], bool]] = []  # (result, court_ok)
+    for variant in build_query_variants(name, city, reg_type, reg_num):
+        results = search_fn(variant)
+        d.credits += 2  # a Firecrawl search is ~2 credits
+        found: list[tuple[dict[str, str], bool]] = []
+        for r in results:
+            blob = f"{r.get('title','')} {r.get('description','')}"
+            ok, court_ok = identity_match(blob, reg_type, reg_num, reg_court)
+            if ok:
+                found.append((r, court_ok))
+        if found:
+            d.matched_variant = variant
+            matched = found
+            break
 
     if not matched:
         d.reason = "no snippet matched registry_number/court (strict gate)"
         return d
 
-    # --- pass 2 only when identity matched but the purpose is missing/truncated.
+    court_matched = any(court_ok for _, court_ok in matched)
+
+    # Best snippet purpose (longest) + the URL it came from; plus the single
+    # least-risk scrape target among the identity-matched results.
+    snippet_purpose: Optional[str] = None
+    purpose_url = ""
+    first_url = ""
+    scrape_url = ""
+    best_rank: Optional[int] = None
+    for r, _ in matched:
+        url = r.get("url") or ""
+        if not first_url:
+            first_url = url
+        blob = f"{r.get('title','')} {r.get('description','')}"
+        cand = extract_gegenstand(blob)
+        if cand and (snippet_purpose is None or len(cand) > len(snippet_purpose)):
+            snippet_purpose = cand
+            purpose_url = url
+        rank = scrape_rank(url)
+        if rank is not None and (best_rank is None or rank < best_rank):
+            best_rank = rank
+            scrape_url = url
+
     purpose = snippet_purpose
-    source = "aggregator"
-    source_ref = matched_url or f"{reg_type} {reg_num} / {reg_court}"
+    if not purpose_url:
+        purpose_url = first_url
+    d.pass_used = "1"
+
+    # --- PASS 2: only when identity matched but the snippet purpose is
+    #     missing/truncated. Scrape the SINGLE least-risk matched URL, then
+    #     re-verify identity on that page before trusting it.
     if is_truncated(purpose):
-        if ur_scrape_url:
+        if scrape_url:
             try:
-                md = scrape_fn(ur_scrape_url)
+                md = scrape_fn(scrape_url)
                 d.credits += 1  # a Firecrawl scrape is ~1 credit
                 full = extract_gegenstand(md)
-                # Re-verify identity on the scraped page before trusting it.
                 ok2, court_ok2 = identity_match(md, reg_type, reg_num, reg_court)
                 if full and ok2:
                     purpose = full
-                    source = "unternehmensregister"
-                    source_ref = ur_scrape_url
+                    purpose_url = scrape_url
                     court_matched = court_matched or court_ok2
+                    d.pass_used = "2"
+                else:
+                    d.reason = ("pass2 scrape did not re-verify identity / "
+                                "no Gegenstand on page; ")
             except Exception as e:  # noqa: BLE001 — pass-2 failure is non-fatal
                 d.reason = f"pass2 scrape failed: {e}; "
         else:
-            d.reason = "no unternehmensregister.de result to scrape; "
+            d.reason = "identity matched but no scrapable result; "
 
+    d.court_matched = court_matched
     if is_truncated(purpose):
         d.reason += "identity matched but no usable Gegenstand recovered"
         d.matched_hrb = reg_num
         d.confidence = "high" if court_matched else "medium"
-        d.source_ref = source_ref
+        d.source_ref = purpose_url or f"{reg_type} {reg_num} / {reg_court}"
         return d
 
     # --- translate (never invent) and finalise the accept.
@@ -440,9 +547,9 @@ def process_company(co: dict[str, Any], *,
     de, ar = translate_fn(purpose)
     d.accepted = True
     d.reason = "accepted"
-    d.source = source
+    d.source = source_class(purpose_url)
     d.confidence = "high" if court_matched else "medium"
-    d.source_ref = source_ref
+    d.source_ref = purpose_url or f"{reg_type} {reg_num} / {reg_court}"
     d.matched_hrb = reg_num
     d.purpose_raw = purpose
     d.purpose_de = de
@@ -514,7 +621,8 @@ def upsert_activity(base: str, key: str, d: Decision) -> Any:
 # paired with synthetic Firecrawl-style results that exercise every gate branch:
 #   accept-high (number+court, full purpose in snippet),
 #   accept-medium (number only, no court in snippet),
-#   accept via pass-2 scrape (snippet purpose truncated),
+#   accept via pass-2 scrape of unternehmensregister.de (snippet truncated),
+#   accept via pass-2 scrape of an AGGREGATOR (northdata, snippet truncated),
 #   reject (wrong court — same name, different company),
 #   reject (no registry token in any snippet).
 MOCK_SAMPLE: list[dict[str, Any]] = [
@@ -563,6 +671,26 @@ MOCK_SAMPLE: list[dict[str, Any]] = [
                 "# A&M Transfer GmbH\nAmtsgericht Saarbrücken HRB 106475\n\n"
                 "Gegenstand des Unternehmens: Güterkraftverkehr, Transport und "
                 "Logistik sowie der Handel mit Fahrzeugen und Ersatzteilen.\n"
+                "Stammkapital: 25.000 EUR")},
+    },
+    {
+        # Identity matched on an aggregator, snippet purpose truncated -> pass 2
+        # scrapes the SINGLE matched aggregator page and recovers the full text.
+        "company": {
+            "entity_id": "0190f3b1-2c44-4a8e-9f7c-1b2c3d4e5f60",
+            "debtor_name": "Nordlicht Logistik GmbH", "debtor_city": "Bremen",
+            "registry_court": "Bremen", "registry_type": "HRB",
+            "registry_number": "34567"},
+        "search": [{
+            "url": "https://www.northdata.com/Nordlicht+Logistik",
+            "title": "Nordlicht Logistik GmbH, Bremen – HRB 34567",
+            "description": ("Amtsgericht Bremen HRB 34567. Gegenstand des "
+                            "Unternehmens: Spedition, Lagerei sowie …")}],
+        "scrape": {
+            "https://www.northdata.com/Nordlicht+Logistik": (
+                "# Nordlicht Logistik GmbH\nAmtsgericht Bremen HRB 34567\n\n"
+                "Gegenstand des Unternehmens: Spedition, Lagerei sowie der "
+                "nationale und internationale Transport von Gütern aller Art.\n"
                 "Stammkapital: 25.000 EUR")},
     },
     {
@@ -619,9 +747,12 @@ def run_mock_dry_run(max_companies: int) -> int:
             scrape_fn=lambda u, _m=scrape_map: _m.get(u, ""),
             translate_fn=fake_translate)
         total_credits += d.credits
+        court_tag = "court+num" if d.court_matched else "num-only"
         if d.accepted:
             accepted += 1
             print(f"[{i}/{len(sample)}] ACCEPT  {d.name!r}")
+            print(f"        variant={d.matched_variant!r} match={court_tag} "
+                  f"pass={d.pass_used}")
             print(f"        source={d.source} confidence={d.confidence} "
                   f"matched_hrb={d.matched_hrb}")
             print(f"        source_ref={d.source_ref}")
@@ -631,7 +762,8 @@ def run_mock_dry_run(max_companies: int) -> int:
                   f"on (entity_id, source) [DRY_RUN — no write]")
         else:
             rejected += 1
-            print(f"[{i}/{len(sample)}] REJECT  {d.name!r}: {d.reason}")
+            print(f"[{i}/{len(sample)}] REJECT  {d.name!r}: {d.reason} "
+                  f"[variant={d.matched_variant!r} match={court_tag}]")
     print("-" * 74)
     print(f"[mock-dry-run] companies={len(sample)} accepted={accepted} "
           f"rejected={rejected} est_credits={total_credits}")
@@ -683,7 +815,7 @@ def main() -> int:
             d = process_company(
                 co,
                 search_fn=lambda q: firecrawl_search(q, fkey),
-                scrape_fn=lambda u: firecrawl_scrape_unternehmensregister(u, fkey),
+                scrape_fn=lambda u: firecrawl_scrape(u, fkey),
                 translate_fn=lambda p: openai_translate(p, okey))
         except Exception as e:  # noqa: BLE001 — never let one company kill the run
             rejected += 1
@@ -692,16 +824,20 @@ def main() -> int:
             continue
         credits += d.credits
 
+        court_tag = "court+num" if d.court_matched else "num-only"
+        trace = (f"variant={d.matched_variant!r} match={court_tag} "
+                 f"pass={d.pass_used or '-'} credits~{d.credits}")
         if not d.accepted:
             rejected += 1
-            print(f"[{i}/{total}] REJECT {name!r}: {d.reason}")
+            print(f"[{i}/{total}] REJECT {name!r}: {d.reason} [{trace}]")
             time.sleep(pause)
             continue
 
         accepted += 1
         if dry:
             print(f"[{i}/{total}] ACCEPT {name!r} -> source={d.source} "
-                  f"conf={d.confidence} hrb={d.matched_hrb} [dry, no write]")
+                  f"conf={d.confidence} hrb={d.matched_hrb} [dry, no write] [{trace}]")
+            print(f"          ref={d.source_ref}")
             print(f"          de={d.purpose_de!r}")
             print(f"          ar={d.purpose_ar!r}")
         else:
@@ -709,7 +845,7 @@ def main() -> int:
                 upsert_activity(base, skey, d)
                 written += 1
                 print(f"[{i}/{total}] WRITE  {name!r} -> source={d.source} "
-                      f"conf={d.confidence} hrb={d.matched_hrb}")
+                      f"conf={d.confidence} hrb={d.matched_hrb} [{trace}]")
             except Exception as e:  # noqa: BLE001
                 print(f"[{i}/{total}] WRITE FAILED {name!r}: {e}")
         time.sleep(pause)

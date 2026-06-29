@@ -4,8 +4,10 @@ These guard the STRICT identity match gate that gave zero false accepts over the
 42 spike companies: a purpose is accepted ONLY when a snippet's registry number
 matches (type-aware) and — when a court is also visible in that snippet — the
 court matches too. An explicit court mismatch (same name, different company) must
-reject. We also cover the pass-2 path (truncated snippet -> scrape the matched
-unternehmensregister.de page) and the refusal to scrape any other host.
+reject. We also cover the pass-1 query-variant fallback, the pass-2 path
+(truncated snippet -> scrape the SINGLE identity-matched result), the least-risk
+scrape-domain ordering, the re-verification of the scraped page, and the refusal
+to scrape handelsregister.de / any non-allow-listed host.
 
 Run with:  python -m unittest discover -s tests
 (stdlib unittest only — no extra test dependency required.)
@@ -93,10 +95,55 @@ class TestScrapeHostGuard(unittest.TestCase):
         self.assertFalse(eca.is_unternehmensregister("https://northdata.com/x"))
         self.assertFalse(eca.is_unternehmensregister("https://handelsregister.de/x"))
 
-    def test_scrape_refuses_non_unternehmensregister(self):
+    def test_scrape_rank_least_risk_order(self):
+        # unternehmensregister.de is preferred (rank 0); aggregators follow in
+        # the documented least-risk order.
+        self.assertEqual(
+            eca.scrape_rank("https://www.unternehmensregister.de/x"), 0)
+        self.assertEqual(eca.scrape_rank("https://handelsregister.ai/x"), 1)
+        self.assertEqual(eca.scrape_rank("https://insolvenz-radar.de/x"), 2)
+        self.assertEqual(eca.scrape_rank("https://viaductus.de/x"), 3)
+        self.assertEqual(
+            eca.scrape_rank("https://firmeneintrag.creditreform.de/x"), 4)
+        self.assertEqual(eca.scrape_rank("https://www.northdata.de/x"), 5)
+        self.assertEqual(eca.scrape_rank("https://northdata.com/x"), 6)
+        # unternehmensregister ranks strictly ahead of every aggregator.
+        self.assertLess(
+            eca.scrape_rank("https://unternehmensregister.de/x"),
+            eca.scrape_rank("https://northdata.com/x"))
+
+    def test_scrape_rank_refuses_handelsregister_de_and_unknown(self):
+        self.assertIsNone(eca.scrape_rank("https://www.handelsregister.de/x"))
+        self.assertIsNone(eca.scrape_rank("https://handelsregister.de/x"))
+        self.assertIsNone(eca.scrape_rank("https://example.com/x"))
+        self.assertIsNone(eca.scrape_rank("https://www.firmenwissen.de/x"))
+
+    def test_scrape_refuses_handelsregister_de(self):
         with self.assertRaises(ValueError):
-            eca.firecrawl_scrape_unternehmensregister(
-                "https://northdata.com/x", "dummy-key")
+            eca.firecrawl_scrape("https://www.handelsregister.de/x", "dummy-key")
+
+    def test_scrape_refuses_non_allowlisted_host(self):
+        with self.assertRaises(ValueError):
+            eca.firecrawl_scrape("https://example.com/x", "dummy-key")
+
+
+class TestQueryVariants(unittest.TestCase):
+    def test_variants_built_in_order_and_deduped(self):
+        v = eca.build_query_variants("Foo GmbH", "Köln", "HRB", "12345")
+        self.assertEqual(v[0], "Foo GmbH Köln Handelsregister")
+        self.assertEqual(v[1], "Foo GmbH Köln HRB")
+        self.assertEqual(v[2], "Foo GmbH Köln Gegenstand")
+        self.assertEqual(v[3], "Foo GmbH HRB 12345")
+
+    def test_variants_handle_missing_city_without_blank_tokens(self):
+        v = eca.build_query_variants("Foo GmbH", "", "HRB", "12345")
+        self.assertIn("Foo GmbH Handelsregister", v)
+        # no double spaces / stray blanks
+        self.assertTrue(all(q == " ".join(q.split()) for q in v))
+
+    def test_variants_default_type_to_hrb(self):
+        v = eca.build_query_variants("Foo GmbH", "Köln", "", "12345")
+        self.assertIn("Foo GmbH Köln HRB", v)
 
 
 class TestProcessCompany(unittest.TestCase):
@@ -150,19 +197,114 @@ class TestProcessCompany(unittest.TestCase):
         self.assertFalse(d.accepted)
         self.assertIn("strict gate", d.reason)
 
-    def test_truncated_without_unternehmensregister_is_not_accepted(self):
+    def test_pass2_scrape_recovers_truncated_purpose_from_aggregator(self):
+        # Truncated snippet on an aggregator -> pass 2 scrapes that matched page
+        # and recovers the full Gegenstand. source = 'aggregator'.
         co = {"entity_id": "e4", "debtor_name": "Qux GmbH", "debtor_city": "Bonn",
               "registry_court": "Bonn", "registry_type": "HRB",
               "registry_number": "777"}
-        # Identity matches but purpose is truncated and only an aggregator result
-        # exists -> we refuse to scrape it, so no usable purpose -> not accepted.
-        search = [{"url": "https://northdata.com/qux", "title": "Qux GmbH",
+        nd = "https://northdata.com/qux"
+        search = [{"url": nd, "title": "Qux GmbH",
                    "description": ("Amtsgericht Bonn HRB 777. Gegenstand des "
                                    "Unternehmens: Beratung von …")}]
+        page = ("Amtsgericht Bonn HRB 777\nGegenstand des Unternehmens: "
+                "Beratung von Unternehmen sowie Vermittlung von Versicherungen.")
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=lambda u: page if u == nd else "",
+            translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.source, "aggregator")
+        self.assertEqual(d.source_ref, nd)
+        self.assertEqual(d.pass_used, "2")
+        self.assertIn("Vermittlung von Versicherungen", d.purpose_raw)
+
+    def test_pass2_prefers_least_risk_domain(self):
+        # Two identity-matched results: an aggregator (northdata) and the
+        # official unternehmensregister.de. Pass 2 must scrape the official one.
+        co = {"entity_id": "e5", "debtor_name": "Zeta GmbH", "debtor_city": "Ulm",
+              "registry_court": "Ulm", "registry_type": "HRB",
+              "registry_number": "888"}
+        nd = "https://northdata.com/zeta"
+        ur = "https://www.unternehmensregister.de/ureg/result.html?id=7"
+        trunc = ("Amtsgericht Ulm HRB 888. Gegenstand des Unternehmens: "
+                 "Herstellung von …")
+        search = [
+            {"url": nd, "title": "Zeta GmbH", "description": trunc},
+            {"url": ur, "title": "Zeta GmbH", "description": trunc},
+        ]
+        scraped = {}
+
+        def scrape(u):
+            scraped["url"] = u
+            return ("Amtsgericht Ulm HRB 888\nGegenstand des Unternehmens: "
+                    "Herstellung von Bauteilen und der Handel damit.")
+
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=scrape, translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(scraped["url"], ur)            # scraped the official one
+        self.assertEqual(d.source, "unternehmensregister")
+        self.assertEqual(d.source_ref, ur)
+
+    def test_pass2_rejects_when_scraped_page_fails_reverification(self):
+        # Identity matched on the snippet, but the scraped page shows a DIFFERENT
+        # HRB -> re-verification fails -> not accepted (no false accept).
+        co = {"entity_id": "e6", "debtor_name": "Mismatch GmbH",
+              "debtor_city": "Bonn", "registry_court": "Bonn",
+              "registry_type": "HRB", "registry_number": "777"}
+        nd = "https://northdata.com/mismatch"
+        search = [{"url": nd, "title": "Mismatch GmbH",
+                   "description": ("Amtsgericht Bonn HRB 777. Gegenstand des "
+                                   "Unternehmens: Beratung von …")}]
+        wrong_page = ("Amtsgericht Bonn HRB 99999\nGegenstand des Unternehmens: "
+                      "Handel mit Waren aller Art.")
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=lambda u: wrong_page, translate_fn=self._translate)
+        self.assertFalse(d.accepted)
+        self.assertIn("re-verify", d.reason)
+
+    def test_query_variant_fallback_finds_match_on_later_variant(self):
+        # First variant returns a non-matching snippet; a later variant returns
+        # the HRB-bearing snippet. process_company must try variants until match.
+        co = {"entity_id": "e7", "debtor_name": "Late GmbH", "debtor_city": "Köln",
+              "registry_court": "Köln", "registry_type": "HRB",
+              "registry_number": "12345"}
+        good = "Late GmbH HRB 12345"  # the "<name> <TYPE> <number>" variant
+        hit = [{"url": "https://northdata.com/late", "title": "Late GmbH",
+                "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                "Unternehmens: Handel mit Möbeln.")}]
+        miss = [{"url": "https://example.com/x", "title": "unrelated",
+                 "description": "no registry token here"}]
+
+        def search(q):
+            return hit if q == good else miss
+
+        d = eca.process_company(
+            co, search_fn=search, scrape_fn=lambda u: "",
+            translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.matched_variant, good)
+        self.assertEqual(d.pass_used, "1")
+
+    def test_unternehmensregister_snippet_only_is_classified_official(self):
+        # Full purpose already in an unternehmensregister.de snippet (no scrape):
+        # source must still be classified 'unternehmensregister' by domain.
+        co = {"entity_id": "e8", "debtor_name": "Off GmbH", "debtor_city": "Köln",
+              "registry_court": "Köln", "registry_type": "HRB",
+              "registry_number": "222"}
+        ur = "https://www.unternehmensregister.de/ureg/result.html?id=3"
+        search = [{"url": ur, "title": "Off GmbH",
+                   "description": ("Amtsgericht Köln HRB 222. Gegenstand des "
+                                   "Unternehmens: Handel mit Textilien.")}]
         d = eca.process_company(
             co, search_fn=lambda q: search,
             scrape_fn=lambda u: "", translate_fn=self._translate)
-        self.assertFalse(d.accepted)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.source, "unternehmensregister")
+        self.assertEqual(d.pass_used, "1")
 
 
 if __name__ == "__main__":
