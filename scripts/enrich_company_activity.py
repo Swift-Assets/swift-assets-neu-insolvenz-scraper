@@ -103,6 +103,23 @@ ACTIVITY_COLUMNS = frozenset({
 # A scraped page shorter than this (after strip) is treated as empty / bot-walled.
 MIN_SCRAPE_CHARS = 80
 
+# PASS-2 scrape rendering: give slow JS pages time to hydrate before reading, and
+# allow a longer per-page timeout. Many "no/low content" pages are just slow JS
+# and recover at the normal 1-credit cost with these options.
+SCRAPE_WAIT_MS = 3500       # Firecrawl waitFor — wait for client-side render
+SCRAPE_TIMEOUT_MS = 60000   # Firecrawl per-page timeout
+
+# Firecrawl credit costs (be frugal — Stealth is 5x a normal scrape).
+NORMAL_SCRAPE_CREDITS = 1
+STEALTH_SCRAPE_CREDITS = 5
+
+# Map an internal pass-2 attempt status to the logged, human reject reason.
+PASS2_REASON = {
+    "low_content": "pass2: scrape returned no/low content",
+    "mismatch": "pass2: HRB re-verify failed",
+    "no_gegenstand": "pass2: no Gegenstand label found on page",
+}
+
 # unternehmensregister.de is the official, free registry portal. It stays the
 # preferred pass-2 scrape target and drives source='unternehmensregister'.
 UNTERNEHMENSREGISTER_HOST = "unternehmensregister.de"
@@ -377,19 +394,30 @@ def firecrawl_search(query: str, key: str, limit: int = 5) -> list[dict[str, str
     return out
 
 
-def firecrawl_scrape(url: str, key: str) -> str:
+def firecrawl_scrape(url: str, key: str, *, stealth: bool = False) -> str:
     """Pass 2: scrape ONE allow-listed page; returns markdown text.
 
-    Only hosts on :data:`SCRAPE_DOMAIN_ORDER` are scraped; handelsregister.de
-    and any other host are refused. One page per call (no Stealth, no retries).
+    Only hosts on :data:`SCRAPE_DOMAIN_ORDER` are scraped; handelsregister.de and
+    any other host are refused. One page per call, no retries. Rendering options
+    (``waitFor`` + a longer ``timeout``) let slow JS pages hydrate at the normal
+    1-credit cost. ``stealth=True`` enables Firecrawl's Stealth proxy — 5 credits,
+    used only as a last-resort fallback by the tiered caller.
     """
     if scrape_rank(url) is None:
         raise ValueError(f"refusing to scrape disallowed host: {url}")
+    body: dict[str, Any] = {
+        "url": url,
+        "formats": ["markdown"],
+        "onlyMainContent": True,
+        "waitFor": SCRAPE_WAIT_MS,
+        "timeout": SCRAPE_TIMEOUT_MS,
+    }
+    if stealth:
+        body["proxy"] = "stealth"   # Firecrawl Enhanced/Stealth proxy (5 credits)
     status, payload = http_json(
         "POST", "https://api.firecrawl.dev/v1/scrape",
         {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        {"url": url, "formats": ["markdown"], "onlyMainContent": True},
-        timeout=90)
+        body, timeout=120)
     if status != 200 or not isinstance(payload, dict):
         raise RuntimeError(f"firecrawl scrape {status}: {str(payload)[:200]}")
     return (payload.get("data") or {}).get("markdown") or ""
@@ -435,7 +463,8 @@ class Decision:
     __slots__ = ("entity_id", "name", "accepted", "reason", "source",
                  "confidence", "source_ref", "matched_hrb", "purpose_de",
                  "purpose_ar", "purpose_raw", "credits", "matched_variant",
-                 "pass_used", "court_matched")
+                 "pass_used", "court_matched", "scrape_tier", "normal_credits",
+                 "stealth_credits")
 
     def __init__(self, entity_id: str, name: str) -> None:
         self.entity_id = entity_id
@@ -453,6 +482,9 @@ class Decision:
         self.matched_variant = ""   # which pass-1 query produced the identity match
         self.pass_used = ""         # "1" (snippet) or "2" (scrape)
         self.court_matched = False  # registry court matched on the source page
+        self.scrape_tier = ""       # which pass-2 tier succeeded: "A"/"B"/"C"
+        self.normal_credits = 0     # 1-credit scrapes spent on this company
+        self.stealth_credits = 0    # 5-credit Stealth scrapes spent on this company
 
 
 def build_query_variants(name: str, city: str, reg_type: str,
@@ -480,12 +512,15 @@ def build_query_variants(name: str, city: str, reg_type: str,
 
 def process_company(co: dict[str, Any], *,
                     search_fn: Callable[[str], list[dict[str, str]]],
-                    scrape_fn: Callable[[str], str],
-                    translate_fn: Callable[[str], tuple[str, str]]) -> Decision:
-    """Run pass 1 + gate (+ pass 2) + translate for one company.
+                    scrape_fn: Callable[..., str],
+                    translate_fn: Callable[[str], tuple[str, str]],
+                    allow_stealth: bool = True) -> Decision:
+    """Run pass 1 + gate (+ tiered pass 2) + translate for one company.
 
     ``co`` needs: entity_id, debtor_name, debtor_city, registry_court,
-    registry_type, registry_number. Returns a :class:`Decision` describing the
+    registry_type, registry_number. ``scrape_fn`` is called as
+    ``scrape_fn(url, stealth=<bool>)``. ``allow_stealth`` gates the 5-credit
+    pass-2 Tier-C fallback. Returns a :class:`Decision` describing the
     accept/reject outcome and (when accepted) the payload to UPSERT.
     """
     name = (co.get("debtor_name") or "").strip()
@@ -522,13 +557,14 @@ def process_company(co: dict[str, Any], *,
 
     court_matched = any(court_ok for _, court_ok in matched)
 
-    # Best snippet purpose (longest) + the URL it came from; plus the single
-    # least-risk scrape target among the identity-matched results.
+    # Best snippet purpose (longest) + the URL it came from; plus ALL identity-
+    # matched scrapable targets, de-duplicated and ordered least-risk first for
+    # the tiered pass-2 escalation below.
     snippet_purpose: Optional[str] = None
     purpose_url = ""
     first_url = ""
-    scrape_url = ""
-    best_rank: Optional[int] = None
+    ranked: list[tuple[int, str]] = []
+    seen_urls: set[str] = set()
     for r, _ in matched:
         url = r.get("url") or ""
         if not first_url:
@@ -539,45 +575,92 @@ def process_company(co: dict[str, Any], *,
             snippet_purpose = cand
             purpose_url = url
         rank = scrape_rank(url)
-        if rank is not None and (best_rank is None or rank < best_rank):
-            best_rank = rank
-            scrape_url = url
+        if rank is not None and url not in seen_urls:
+            seen_urls.add(url)
+            ranked.append((rank, url))
+    ranked.sort(key=lambda t: t[0])
+    scrape_targets = [u for _, u in ranked]
 
     purpose = snippet_purpose
     if not purpose_url:
         purpose_url = first_url
     d.pass_used = "1"
 
-    # --- PASS 2: only when identity matched but the snippet purpose is
-    #     missing/truncated. Scrape the SINGLE least-risk matched URL. Identity
-    #     was already confirmed in pass 1, so pass 2 only rejects when the page
-    #     shows a clearly DIFFERENT HRB; an HRB absent from the page is trusted
-    #     (accept at medium). Distinct, logged failure cases below.
-    pass2_hrb = ""  # "match" | "mismatch" | "absent" when a scrape was attempted
+    # --- PASS 2 (tiered): only when identity matched but the snippet purpose is
+    #     missing/truncated. Cheap easy sources first; expensive Stealth last.
+    #       TIER A  normal render-scrape of the least-risk matched target (1 cr)
+    #       TIER B  normal scrape of the OTHER matched targets, in order (1 cr ea)
+    #       TIER C  Stealth retry of the primary target (5 cr) — only when A+B
+    #               failed on RENDERING (empty / no label) and allow_stealth.
+    #     Identity was already confirmed in pass 1; a page is "usable" iff it
+    #     yields a Gegenstand clause and does not show a clearly DIFFERENT HRB.
+    pass2_hrb = ""  # "match" | "mismatch" | "absent" on the page that supplied it
+
+    def _attempt(url: str, stealth: bool) -> dict[str, Any]:
+        md = scrape_fn(url, stealth=stealth)
+        if stealth:
+            d.credits += STEALTH_SCRAPE_CREDITS
+            d.stealth_credits += STEALTH_SCRAPE_CREDITS
+        else:
+            d.credits += NORMAL_SCRAPE_CREDITS
+            d.normal_credits += NORMAL_SCRAPE_CREDITS
+        if not md or len(md.strip()) < MIN_SCRAPE_CHARS:
+            return {"status": "low_content"}
+        hrb = verify_hrb_on_page(md, reg_num)
+        if hrb == "mismatch":
+            return {"status": "mismatch"}
+        full = extract_gegenstand(md)
+        if not full:
+            return {"status": "no_gegenstand"}
+        court_ok = False
+        if hrb == "match":
+            # Page re-confirms the HRB -> allow a court upgrade to 'high'.
+            _, court_ok = identity_match(md, reg_type, reg_num, reg_court)
+        return {"status": "ok", "purpose": full, "hrb": hrb,
+                "court_ok": court_ok, "url": url}
+
     if is_truncated(purpose):
-        if scrape_url:
+        if scrape_targets:
+            primary = scrape_targets[0]
             try:
-                md = scrape_fn(scrape_url)
-                d.credits += 1  # a Firecrawl scrape is ~1 credit
-                if not md or len(md.strip()) < MIN_SCRAPE_CHARS:
-                    d.reason = "pass2: scrape returned no/low content; "
+                used: Optional[dict[str, Any]] = None
+                tier = ""
+                # TIER A — least-risk matched target, rendered normal scrape.
+                res = _attempt(primary, stealth=False)
+                primary_status = res["status"]
+                if res["status"] == "ok":
+                    used, tier = res, "A"
+                # TIER B — other matched targets, in least-risk order, normal cost.
+                if used is None:
+                    for alt in scrape_targets[1:]:
+                        rb = _attempt(alt, stealth=False)
+                        if rb["status"] == "ok":
+                            used, tier = rb, "B"
+                            break
+                # TIER C — Stealth retry of the PRIMARY page, only for rendering
+                # failures (a mismatch is the wrong company; Stealth won't help).
+                if (used is None and allow_stealth
+                        and primary_status in ("low_content", "no_gegenstand")):
+                    print(f"[stealth] {name!r}: A+B failed; retrying {primary} "
+                          f"with Stealth ({STEALTH_SCRAPE_CREDITS} credits)")
+                    rc = _attempt(primary, stealth=True)
+                    if rc["status"] == "ok":
+                        used, tier = rc, "C"
+
+                if used is not None:
+                    purpose = used["purpose"]
+                    purpose_url = used["url"]
+                    pass2_hrb = used["hrb"]
+                    court_matched = court_matched or used["court_ok"]
+                    d.pass_used = "2"
+                    d.scrape_tier = tier
                 else:
-                    pass2_hrb = verify_hrb_on_page(md, reg_num)
-                    if pass2_hrb == "mismatch":
-                        d.reason = "pass2: HRB re-verify failed; "
-                    else:
-                        full = extract_gegenstand(md)
-                        if not full:
-                            d.reason = "pass2: no Gegenstand label found on page; "
-                        else:
-                            purpose = full
-                            purpose_url = scrape_url
-                            d.pass_used = "2"
-                            if pass2_hrb == "match":
-                                # Page re-confirms the HRB -> allow a court upgrade.
-                                _, court_ok2 = identity_match(
-                                    md, reg_type, reg_num, reg_court)
-                                court_matched = court_matched or court_ok2
+                    d.reason = PASS2_REASON.get(
+                        primary_status, "pass2: scrape returned no/low content")
+                    if allow_stealth and primary_status in (
+                            "low_content", "no_gegenstand"):
+                        d.reason += " (stealth retried)"
+                    d.reason += "; "
             except Exception as e:  # noqa: BLE001 — pass-2 failure is non-fatal
                 d.reason = f"pass2 scrape failed: {e}; "
         else:
@@ -695,6 +778,7 @@ def upsert_activity(base: str, key: str, d: Decision) -> Any:
 #   accept via pass-2 scrape of unternehmensregister.de (snippet truncated),
 #   accept via pass-2 scrape of an AGGREGATOR (northdata, snippet truncated),
 #   accept via pass-2 with HRB ABSENT on the page + 'Tätigkeit' label (medium),
+#   accept via pass-2 TIER C (normal scrape bot-walled -> Stealth recovers it),
 #   reject (wrong court — same name, different company),
 #   reject (no registry token in any snippet).
 MOCK_SAMPLE: list[dict[str, Any]] = [
@@ -787,6 +871,31 @@ MOCK_SAMPLE: list[dict[str, Any]] = [
                 "Mitarbeiter: 12")},
     },
     {
+        # Single matched result on a HARD aggregator (northdata). The normal
+        # render-scrape comes back bot-walled/empty (Tier A fails, no Tier-B
+        # alternative) -> Tier C retries the SAME page with Stealth (5 credits),
+        # which renders the full Gegenstand. Demonstrates the last-resort path.
+        "company": {
+            "entity_id": "02b3c4d5-e6f7-48a9-b0c1-2d3e4f5a6b7c",
+            "debtor_name": "Hanseatic Stealth Handel GmbH",
+            "debtor_city": "Hamburg", "registry_court": "Hamburg",
+            "registry_type": "HRB", "registry_number": "667788"},
+        "search": [{
+            "url": "https://www.northdata.com/Hanseatic+Stealth+Handel",
+            "title": "Hanseatic Stealth Handel GmbH, Hamburg – HRB 667788",
+            "description": ("Amtsgericht Hamburg HRB 667788. Gegenstand des "
+                            "Unternehmens: Im- und Export von …")}],
+        "scrape": {
+            "https://www.northdata.com/Hanseatic+Stealth+Handel": {
+                "normal": "",  # bot wall on the normal 1-credit render scrape
+                "stealth": (
+                    "# Hanseatic Stealth Handel GmbH\nAmtsgericht Hamburg "
+                    "HRB 667788\n\nGegenstand des Unternehmens: Im- und Export "
+                    "von Waren aller Art sowie der Groß- und Einzelhandel "
+                    "damit.\nStammkapital: 25.000 EUR")},
+        },
+    },
+    {
         "company": {
             "entity_id": "012dac4b-8495-40dc-80d7-0e25ce7ccb89",
             "debtor_name": "ATUGA Bau UG (haftungsbeschränkt)",
@@ -829,25 +938,41 @@ def run_mock_dry_run(max_companies: int) -> int:
         # Offline stub — a real run calls GPT-4o-mini. Marks output as mocked.
         return (f"[de-mock] {purpose_de[:90]}", "[ar-mock] ترجمة عربية وهمية")
 
+    def fake_scrape(url: str, scrape_map: dict[str, Any], stealth: bool) -> str:
+        # A mock value may be a plain string (same for normal/stealth) or a dict
+        # {"normal": ..., "stealth": ...} to exercise the Tier-C Stealth path.
+        v = scrape_map.get(url, "")
+        if isinstance(v, dict):
+            return v.get("stealth", "") if stealth else v.get("normal", "")
+        return v
+
     accepted = rejected = 0
-    total_credits = 0
+    total_credits = normal_credits = stealth_credits = 0
+    tiers = {"A": 0, "B": 0, "C": 0}
     for i, item in enumerate(sample, 1):
         co = item["company"]
         scrape_map = item.get("scrape", {})
         d = process_company(
             co,
             search_fn=lambda q, _s=item["search"]: _s,
-            scrape_fn=lambda u, _m=scrape_map: _m.get(u, ""),
+            scrape_fn=lambda u, stealth=False, _m=scrape_map: fake_scrape(
+                u, _m, stealth),
             translate_fn=fake_translate)
         total_credits += d.credits
+        normal_credits += d.normal_credits
+        stealth_credits += d.stealth_credits
+        if d.scrape_tier in tiers:
+            tiers[d.scrape_tier] += 1
         court_tag = "court+num" if d.court_matched else "num-only"
         if d.accepted:
             accepted += 1
             print(f"[{i}/{len(sample)}] ACCEPT  {d.name!r}")
             print(f"        variant={d.matched_variant!r} match={court_tag} "
-                  f"pass={d.pass_used}")
+                  f"pass={d.pass_used} tier={d.scrape_tier or '-'}")
             print(f"        source={d.source} confidence={d.confidence} "
                   f"matched_hrb={d.matched_hrb}")
+            print(f"        credits={d.credits} (norm={d.normal_credits} "
+                  f"stealth={d.stealth_credits})")
             print(f"        source_ref={d.source_ref}")
             print(f"        activity_de={d.purpose_de}")
             print(f"        activity_ar={d.purpose_ar}")
@@ -859,7 +984,10 @@ def run_mock_dry_run(max_companies: int) -> int:
                   f"[variant={d.matched_variant!r} match={court_tag}]")
     print("-" * 74)
     print(f"[mock-dry-run] companies={len(sample)} accepted={accepted} "
-          f"rejected={rejected} est_credits={total_credits}")
+          f"rejected={rejected}")
+    print(f"[mock-dry-run] tiers A={tiers['A']} B={tiers['B']} C={tiers['C']} "
+          f"| credits total={total_credits} (norm={normal_credits} "
+          f"stealth={stealth_credits})")
     print("[mock-dry-run] NOTHING was written to the database.")
     return 0
 
@@ -873,6 +1001,7 @@ def main() -> int:
     fetch_limit = int(os.environ.get("CANDIDATE_FETCH_LIMIT", "1000"))
     pause = float(os.environ.get("REQUEST_PAUSE_SECONDS", "1.0"))
     time_budget = float(os.environ.get("TIME_BUDGET_SECONDS", "3300"))
+    allow_stealth = truthy(os.environ.get("ALLOW_STEALTH", "1"))
 
     have_secrets = all(os.environ.get(k, "").strip() for k in (
         "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
@@ -896,9 +1025,11 @@ def main() -> int:
 
     total = len(candidates)
     print(f"[start] {total} candidate companies (dry_run={dry}, "
-          f"max_companies={max_companies})")
+          f"max_companies={max_companies}, allow_stealth={allow_stealth})")
 
     accepted = rejected = written = credits = 0
+    normal_credits = stealth_credits = 0
+    tiers = {"A": 0, "B": 0, "C": 0}
     for i, co in enumerate(candidates, 1):
         if time.monotonic() - start > time_budget:
             print(f"[stop] time budget reached after {i - 1} companies")
@@ -908,18 +1039,27 @@ def main() -> int:
             d = process_company(
                 co,
                 search_fn=lambda q: firecrawl_search(q, fkey),
-                scrape_fn=lambda u: firecrawl_scrape(u, fkey),
-                translate_fn=lambda p: openai_translate(p, okey))
+                scrape_fn=lambda u, stealth=False: firecrawl_scrape(
+                    u, fkey, stealth=stealth),
+                translate_fn=lambda p: openai_translate(p, okey),
+                allow_stealth=allow_stealth)
         except Exception as e:  # noqa: BLE001 — never let one company kill the run
             rejected += 1
             print(f"[{i}/{total}] ERROR  {name!r}: {e}")
             time.sleep(pause)
             continue
         credits += d.credits
+        normal_credits += d.normal_credits
+        stealth_credits += d.stealth_credits
+        if d.scrape_tier in tiers:
+            tiers[d.scrape_tier] += 1
 
         court_tag = "court+num" if d.court_matched else "num-only"
+        tier_tag = f"tier={d.scrape_tier}" if d.scrape_tier else "tier=-"
         trace = (f"variant={d.matched_variant!r} match={court_tag} "
-                 f"pass={d.pass_used or '-'} credits~{d.credits}")
+                 f"pass={d.pass_used or '-'} {tier_tag} "
+                 f"credits~{d.credits} (norm={d.normal_credits} "
+                 f"stealth={d.stealth_credits})")
         if not d.accepted:
             rejected += 1
             print(f"[{i}/{total}] REJECT {name!r}: {d.reason} [{trace}]")
@@ -944,7 +1084,10 @@ def main() -> int:
         time.sleep(pause)
 
     print(f"[done] companies={total} accepted={accepted} rejected={rejected} "
-          f"written={written} est_credits={credits} dry_run={dry}")
+          f"written={written} dry_run={dry}")
+    print(f"[tiers] pass2 successes A={tiers['A']} B={tiers['B']} C={tiers['C']}")
+    print(f"[credits] total={credits} (scrape normal={normal_credits}, "
+          f"scrape stealth={stealth_credits})")
     return 0
 
 
