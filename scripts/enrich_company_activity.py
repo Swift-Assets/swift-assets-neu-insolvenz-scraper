@@ -84,12 +84,24 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib import error, parse, request
 
 SCHEMA = "swift_v2"
 ACTIVITY_TABLE = "company_activity_sources"
 SOURCE_VIEW = "source_neu_insolvenz_announcements"
+
+# Exact writable columns of swift_v2.company_activity_sources. id/created_at/
+# updated_at are DB-managed and never sent; extracted_at we set explicitly.
+# The UPSERT payload keys MUST be a subset of this set (fail-fast guard below).
+ACTIVITY_COLUMNS = frozenset({
+    "entity_id", "source", "activity_de", "activity_ar",
+    "confidence", "source_ref", "matched_hrb", "extracted_at",
+})
+
+# A scraped page shorter than this (after strip) is treated as empty / bot-walled.
+MIN_SCRAPE_CHARS = 80
 
 # unternehmensregister.de is the official, free registry portal. It stays the
 # preferred pass-2 scrape target and drives source='unternehmensregister'.
@@ -118,10 +130,13 @@ REG_TOKEN_RE = re.compile(
 # "Amtsgericht <Name>" — used to decide whether a court is *present* in a snippet.
 AMTSGERICHT_RE = re.compile(
     r"Amtsgericht\s+([A-Za-zÄÖÜäöüß./\- ]{3,40})", re.IGNORECASE)
-# Gegenstand / Unternehmensgegenstand introducers.
+# Gegenstand / Unternehmensgegenstand introducers, plus common aggregator
+# labels (Tätigkeit / Geschäftszweck / Unternehmenszweck). Longest alternatives
+# are listed first so they win over the bare "Gegenstand".
 GEGENSTAND_RE = re.compile(
     r"(?:Unternehmensgegenstand|Gegenstand\s+des\s+Unternehmens|"
-    r"Gegenstand\s+der\s+Gesellschaft|Gegenstand)\s*[:\-–]?\s*(.+)",
+    r"Gegenstand\s+der\s+Gesellschaft|Geschäftszweck|Unternehmenszweck|"
+    r"Tätigkeit|Gegenstand)\s*[:\-–]?\s*(.+)",
     re.IGNORECASE)
 ELLIPSIS = ("…", "...", "…")
 
@@ -288,6 +303,28 @@ def identity_match(text: str, reg_type: str, reg_num: str,
     if not court_ok:
         return (False, False)           # explicit court mismatch -> reject
     return (True, True)                  # number + court -> high
+
+
+def verify_hrb_on_page(text: str, reg_num: str) -> str:
+    """Tolerant pass-2 re-verification of a scraped page against the company HRB.
+
+    Identity was ALREADY confirmed from the pass-1 snippet, so this is only a
+    guard against scraping a clearly *different* company. Comparison is by digits
+    only — :func:`norm_regnum` strips spaces/punctuation, leading zeros, the
+    ``HRB``/``HRA`` prefix and any trailing court letter — and is type-agnostic.
+
+    Returns one of:
+    * ``"match"``    — a registry token on the page matches the company number;
+    * ``"mismatch"`` — registry tokens are present but NONE match (different co.);
+    * ``"absent"``   — no registry token on the page at all (NOT a mismatch).
+    """
+    target = norm_regnum(reg_num)
+    if not target:
+        return "absent"
+    nums = [norm_regnum(m.group(2)) for m in REG_TOKEN_RE.finditer(text or "")]
+    if not nums:
+        return "absent"
+    return "match" if target in nums else "mismatch"
 
 
 def extract_gegenstand(text: str) -> Optional[str]:
@@ -512,23 +549,35 @@ def process_company(co: dict[str, Any], *,
     d.pass_used = "1"
 
     # --- PASS 2: only when identity matched but the snippet purpose is
-    #     missing/truncated. Scrape the SINGLE least-risk matched URL, then
-    #     re-verify identity on that page before trusting it.
+    #     missing/truncated. Scrape the SINGLE least-risk matched URL. Identity
+    #     was already confirmed in pass 1, so pass 2 only rejects when the page
+    #     shows a clearly DIFFERENT HRB; an HRB absent from the page is trusted
+    #     (accept at medium). Distinct, logged failure cases below.
+    pass2_hrb = ""  # "match" | "mismatch" | "absent" when a scrape was attempted
     if is_truncated(purpose):
         if scrape_url:
             try:
                 md = scrape_fn(scrape_url)
                 d.credits += 1  # a Firecrawl scrape is ~1 credit
-                full = extract_gegenstand(md)
-                ok2, court_ok2 = identity_match(md, reg_type, reg_num, reg_court)
-                if full and ok2:
-                    purpose = full
-                    purpose_url = scrape_url
-                    court_matched = court_matched or court_ok2
-                    d.pass_used = "2"
+                if not md or len(md.strip()) < MIN_SCRAPE_CHARS:
+                    d.reason = "pass2: scrape returned no/low content; "
                 else:
-                    d.reason = ("pass2 scrape did not re-verify identity / "
-                                "no Gegenstand on page; ")
+                    pass2_hrb = verify_hrb_on_page(md, reg_num)
+                    if pass2_hrb == "mismatch":
+                        d.reason = "pass2: HRB re-verify failed; "
+                    else:
+                        full = extract_gegenstand(md)
+                        if not full:
+                            d.reason = "pass2: no Gegenstand label found on page; "
+                        else:
+                            purpose = full
+                            purpose_url = scrape_url
+                            d.pass_used = "2"
+                            if pass2_hrb == "match":
+                                # Page re-confirms the HRB -> allow a court upgrade.
+                                _, court_ok2 = identity_match(
+                                    md, reg_type, reg_num, reg_court)
+                                court_matched = court_matched or court_ok2
             except Exception as e:  # noqa: BLE001 — pass-2 failure is non-fatal
                 d.reason = f"pass2 scrape failed: {e}; "
         else:
@@ -548,7 +597,12 @@ def process_company(co: dict[str, Any], *,
     d.accepted = True
     d.reason = "accepted"
     d.source = source_class(purpose_url)
-    d.confidence = "high" if court_matched else "medium"
+    # high only when number+court matched; a pass-2 page that lacked the HRB was
+    # trusted from pass 1 but cannot earn 'high' here -> cap at medium.
+    if d.pass_used == "2" and pass2_hrb == "absent":
+        d.confidence = "medium"
+    else:
+        d.confidence = "high" if court_matched else "medium"
     d.source_ref = purpose_url or f"{reg_type} {reg_num} / {reg_court}"
     d.matched_hrb = reg_num
     d.purpose_raw = purpose
@@ -598,20 +652,37 @@ def fetch_candidates(base: str, key: str, max_companies: int,
     return out
 
 
-def upsert_activity(base: str, key: str, d: Decision) -> Any:
-    body = [{
+def activity_payload(d: Decision) -> dict[str, Any]:
+    """Build the UPSERT row and fail fast if it carries any unknown column.
+
+    The row maps the worker's internal fields onto the EXACT live schema of
+    ``swift_v2.company_activity_sources``. ``purpose_raw`` is intentionally not a
+    column — the raw scraped Gegenstand is folded into ``activity_de`` by the
+    translator and never written separately.
+    """
+    row: dict[str, Any] = {
         "entity_id": d.entity_id,
         "source": d.source,
         "activity_de": d.purpose_de,
         "activity_ar": d.purpose_ar,
-        "purpose_raw": d.purpose_raw,
         "confidence": d.confidence,
         "source_ref": d.source_ref,
         "matched_hrb": d.matched_hrb,
-    }]
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+    }
+    unknown = set(row) - ACTIVITY_COLUMNS
+    if unknown:
+        raise RuntimeError(
+            f"refusing to UPSERT unknown column(s) {sorted(unknown)} into "
+            f"{SCHEMA}.{ACTIVITY_TABLE}; allowed columns: "
+            f"{sorted(ACTIVITY_COLUMNS)}")
+    return row
+
+
+def upsert_activity(base: str, key: str, d: Decision) -> Any:
     return postgrest(
         "POST", f"{ACTIVITY_TABLE}?on_conflict=entity_id,source", base, key,
-        body, prefer="resolution=merge-duplicates,return=minimal")
+        [activity_payload(d)], prefer="resolution=merge-duplicates,return=minimal")
 
 
 # --------------------------------------------------------------------------- #
@@ -623,6 +694,7 @@ def upsert_activity(base: str, key: str, d: Decision) -> Any:
 #   accept-medium (number only, no court in snippet),
 #   accept via pass-2 scrape of unternehmensregister.de (snippet truncated),
 #   accept via pass-2 scrape of an AGGREGATOR (northdata, snippet truncated),
+#   accept via pass-2 with HRB ABSENT on the page + 'Tätigkeit' label (medium),
 #   reject (wrong court — same name, different company),
 #   reject (no registry token in any snippet).
 MOCK_SAMPLE: list[dict[str, Any]] = [
@@ -692,6 +764,27 @@ MOCK_SAMPLE: list[dict[str, Any]] = [
                 "Gegenstand des Unternehmens: Spedition, Lagerei sowie der "
                 "nationale und internationale Transport von Gütern aller Art.\n"
                 "Stammkapital: 25.000 EUR")},
+    },
+    {
+        # Snippet truncated; the matched aggregator page does NOT restate the HRB
+        # but carries a 'Tätigkeit' label. Absence is not a mismatch -> we trust
+        # the pass-1 identity and accept the recovered purpose at medium.
+        "company": {
+            "entity_id": "01a2b3c4-d5e6-47f8-9a0b-1c2d3e4f5a6b",
+            "debtor_name": "Seeblick Gastro GmbH", "debtor_city": "Konstanz",
+            "registry_court": "Freiburg", "registry_type": "HRB",
+            "registry_number": "445566"},
+        "search": [{
+            "url": "https://www.viaductus.de/seeblick-gastro",
+            "title": "Seeblick Gastro GmbH, Konstanz – HRB 445566",
+            "description": ("Amtsgericht Freiburg HRB 445566. Gegenstand des "
+                            "Unternehmens: Betrieb von …")}],
+        "scrape": {
+            "https://www.viaductus.de/seeblick-gastro": (
+                "# Seeblick Gastro GmbH\nKonstanz\n\n"
+                "Tätigkeit: Betrieb von Restaurants und Cafés sowie Catering "
+                "und die Ausrichtung von Veranstaltungen.\n"
+                "Mitarbeiter: 12")},
     },
     {
         "company": {
