@@ -81,6 +81,18 @@ class TestGegenstand(unittest.TestCase):
     def test_extract_none_when_absent(self):
         self.assertIsNone(eca.extract_gegenstand("HRB 1. Stammkapital 25.000 EUR"))
 
+    def test_extract_aggregator_labels(self):
+        # Broadened labels used on aggregator pages.
+        self.assertEqual(
+            eca.extract_gegenstand("Tätigkeit: Betrieb von Cafés."),
+            "Betrieb von Cafés.")
+        self.assertEqual(
+            eca.extract_gegenstand("Geschäftszweck: Handel mit Waren."),
+            "Handel mit Waren.")
+        self.assertEqual(
+            eca.extract_gegenstand("Unternehmenszweck: Beratung von Firmen."),
+            "Beratung von Firmen.")
+
     def test_is_truncated(self):
         self.assertTrue(eca.is_truncated(None))
         self.assertTrue(eca.is_truncated("Güterkraftverkehr sowie damit …"))
@@ -264,7 +276,62 @@ class TestProcessCompany(unittest.TestCase):
             co, search_fn=lambda q: search,
             scrape_fn=lambda u: wrong_page, translate_fn=self._translate)
         self.assertFalse(d.accepted)
-        self.assertIn("re-verify", d.reason)
+        self.assertIn("pass2: HRB re-verify failed", d.reason)
+
+    def test_pass2_absent_hrb_is_not_mismatch_accepts_medium(self):
+        # Snippet truncated (pass-1 had court+num). The scraped page carries a
+        # Gegenstand under a 'Tätigkeit' label but NO HRB -> absence is not a
+        # mismatch: trust pass-1 identity, accept the purpose, cap confidence at
+        # 'medium' since the page could not re-confirm the HRB.
+        co = {"entity_id": "e9", "debtor_name": "See GmbH", "debtor_city": "Konstanz",
+              "registry_court": "Freiburg", "registry_type": "HRB",
+              "registry_number": "445566"}
+        nd = "https://www.viaductus.de/see"
+        search = [{"url": nd, "title": "See GmbH",
+                   "description": ("Amtsgericht Freiburg HRB 445566. Gegenstand "
+                                   "des Unternehmens: Betrieb von …")}]
+        page = ("# See GmbH\nKonstanz\n\nTätigkeit: Betrieb von Restaurants und "
+                "Cafés sowie Catering und die Ausrichtung von Veranstaltungen.\n"
+                "Mitarbeiter: 12")
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=lambda u: page, translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.pass_used, "2")
+        self.assertEqual(d.source, "aggregator")
+        self.assertEqual(d.confidence, "medium")
+        self.assertIn("Catering", d.purpose_raw)
+
+    def test_pass2_low_content_reason(self):
+        co = {"entity_id": "e10", "debtor_name": "Empty GmbH",
+              "debtor_city": "Bonn", "registry_court": "Bonn",
+              "registry_type": "HRB", "registry_number": "777"}
+        nd = "https://northdata.com/empty"
+        search = [{"url": nd, "title": "Empty GmbH",
+                   "description": ("Amtsgericht Bonn HRB 777. Gegenstand des "
+                                   "Unternehmens: Beratung von …")}]
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=lambda u: "", translate_fn=self._translate)
+        self.assertFalse(d.accepted)
+        self.assertIn("pass2: scrape returned no/low content", d.reason)
+
+    def test_pass2_no_gegenstand_label_reason(self):
+        co = {"entity_id": "e11", "debtor_name": "NoPurp GmbH",
+              "debtor_city": "Ulm", "registry_court": "Ulm",
+              "registry_type": "HRB", "registry_number": "555"}
+        nd = "https://northdata.com/nopurp"
+        search = [{"url": nd, "title": "NoPurp GmbH",
+                   "description": ("Amtsgericht Ulm HRB 555. Gegenstand des "
+                                   "Unternehmens: Herstellung von …")}]
+        # HRB matches (re-verify ok) but the page has no purpose label at all.
+        page = ("Amtsgericht Ulm HRB 555. Kontaktdaten und Anschrift der "
+                "Gesellschaft, Telefon und Öffnungszeiten folgen weiter unten.")
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=lambda u: page, translate_fn=self._translate)
+        self.assertFalse(d.accepted)
+        self.assertIn("pass2: no Gegenstand label found on page", d.reason)
 
     def test_query_variant_fallback_finds_match_on_later_variant(self):
         # First variant returns a non-matching snippet; a later variant returns
@@ -305,6 +372,67 @@ class TestProcessCompany(unittest.TestCase):
         self.assertTrue(d.accepted)
         self.assertEqual(d.source, "unternehmensregister")
         self.assertEqual(d.pass_used, "1")
+
+
+class TestVerifyHrbOnPage(unittest.TestCase):
+    def test_match_tolerant_of_formatting(self):
+        self.assertEqual(
+            eca.verify_hrb_on_page("Amtsgericht Ulm HRB 555", "555"), "match")
+        self.assertEqual(
+            eca.verify_hrb_on_page("HRB 0704974 B", "704974"), "match")
+
+    def test_match_is_type_agnostic(self):
+        # 'ignore HRB/HRA prefixes' — a matching number counts regardless of type.
+        self.assertEqual(eca.verify_hrb_on_page("HRA 555", "555"), "match")
+
+    def test_mismatch_only_when_different_number_present(self):
+        self.assertEqual(eca.verify_hrb_on_page("HRB 99999", "555"), "mismatch")
+
+    def test_absence_is_not_a_mismatch(self):
+        self.assertEqual(
+            eca.verify_hrb_on_page("Tätigkeit: Handel mit Waren.", "555"),
+            "absent")
+        self.assertEqual(eca.verify_hrb_on_page("", "555"), "absent")
+
+
+class TestUpsertPayload(unittest.TestCase):
+    def _decision(self):
+        d = eca.Decision("ent-1", "Foo GmbH")
+        d.source = "aggregator"
+        d.purpose_de = "de summary"
+        d.purpose_ar = "ar summary"
+        d.confidence = "medium"
+        d.source_ref = "https://northdata.com/foo"
+        d.matched_hrb = "12345"
+        d.purpose_raw = "raw scraped Gegenstand text"
+        return d
+
+    def test_payload_keys_are_subset_of_live_schema(self):
+        row = eca.activity_payload(self._decision())
+        self.assertTrue(set(row).issubset(eca.ACTIVITY_COLUMNS))
+
+    def test_payload_omits_purpose_raw_and_db_managed_columns(self):
+        row = eca.activity_payload(self._decision())
+        for col in ("purpose_raw", "id", "created_at", "updated_at"):
+            self.assertNotIn(col, row)
+
+    def test_payload_sets_expected_columns(self):
+        row = eca.activity_payload(self._decision())
+        self.assertIn("extracted_at", row)
+        self.assertEqual(row["entity_id"], "ent-1")
+        self.assertEqual(row["matched_hrb"], "12345")
+        self.assertEqual(row["source"], "aggregator")
+
+    def test_guard_fails_fast_on_unknown_column(self):
+        # Simulate schema drift so a real key becomes "unknown" -> must raise.
+        orig = eca.ACTIVITY_COLUMNS
+        eca.ACTIVITY_COLUMNS = frozenset(orig - {"matched_hrb"})
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                eca.activity_payload(self._decision())
+            self.assertIn("matched_hrb", str(ctx.exception))
+        finally:
+            eca.ACTIVITY_COLUMNS = orig
 
 
 if __name__ == "__main__":
