@@ -2,22 +2,32 @@ name: Enrich Company Activity (Gegenstand DE+AR) (manual / on-demand)
 
 # Manual only for now. Fills swift_v2.company_activity_sources with each insolvent
 # company's official business purpose (Gegenstand) in German + Arabic.
+#   PASS 0  SerpApi SEARCH "<name> <city> Handelsregister" -> snippets only (no scrape).
 #   PASS 1  Firecrawl SEARCH "<name> <city> Handelsregister" -> read snippets only.
 #   GATE    accept a purpose ONLY when a snippet's registry number (and court, when
 #           visible) matches the company's registry_number/registry_court.
-#   PASS 2  for accepted-identity companies with a missing/truncated snippet purpose,
-#           Firecrawl SCRAPE the matched unternehmensregister.de page ONLY.
+#   PASS 2  Firecrawl-only: for identity-matched companies with a truncated snippet
+#           purpose, SCRAPE the matched page (least-risk allow-list, never handelsregister.de).
 #   TRANSLATE GPT-4o-mini -> activity_de (1-2 sentences) + faithful activity_ar.
-# Bounded by max_companies; idempotent UPSERT on (entity_id, source); safe to re-run.
+# Bounded by max_companies (BATCH SIZE / easy cap); idempotent UPSERT on
+# (entity_id, source); attempts ledger advances reruns; safe to re-run.
 on:
   workflow_dispatch:
     inputs:
       max_companies:
-        description: "Max companies to process this run"
+        description: "Max companies to process this run (batch size / cap)"
         required: false
         default: "25"
       dry_run:
         description: "Run the full pipeline but do NOT write (1 = dry run)"
+        required: false
+        default: "1"
+      use_serpapi:
+        description: "Use SerpApi as PASS 0 snippet source (1 = on)"
+        required: false
+        default: "1"
+      use_firecrawl:
+        description: "Use Firecrawl PASS 1/2 (1 = on; no-ops if credits are out)"
         required: false
         default: "1"
 
@@ -41,10 +51,13 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MAX_COMPANIES: ${{ github.event.inputs.max_companies }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+          USE_SERPAPI: ${{ github.event.inputs.use_serpapi }}
+          USE_FIRECRAWL: ${{ github.event.inputs.use_firecrawl }}
           REQUEST_PAUSE_SECONDS: "1.0"
         run: python scripts/enrich_company_activity.py
 

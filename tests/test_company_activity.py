@@ -846,5 +846,133 @@ class TestFetchCandidatesAdvance(unittest.TestCase):
         self.assertGreaterEqual(stats["scanned"], 6)
 
 
+class TestSerpApi(unittest.TestCase):
+    """PASS 0 — SerpApi snippets reuse the existing gate/filter/translate, no scrape."""
+
+    def _translate(self, de):
+        return (f"de:{de[:20]}", "ar:عربي")
+
+    def _echo_translate(self, de):
+        # Echoes the German purpose (used to exercise the empty-meaning filter).
+        return (de, "نشاط")
+
+    def _co(self, court="Köln", num="12345"):
+        return {"entity_id": "s1", "debtor_name": "Foo GmbH", "debtor_city": "Köln",
+                "registry_court": court, "registry_type": "HRB",
+                "registry_number": num}
+
+    def _no_scrape(self, url, stealth=False):
+        raise AssertionError("SerpApi path must never scrape")
+
+    def test_serpapi_search_normalizes_organic_results(self):
+        captured = {}
+
+        def fake_http_json(method, url, headers, body=None, timeout=60):
+            captured["method"] = method
+            captured["url"] = url
+            return 200, {"organic_results": [
+                {"link": "https://northdata.com/x", "title": "Foo GmbH",
+                 "snippet": "Amtsgericht Köln HRB 12345. Gegenstand: Handel.",
+                 "snippet_highlighted_words": ["HRB", "12345"]},
+                {"title": "no link"},  # missing link/snippet tolerated
+            ]}
+
+        orig = eca.http_json
+        eca.http_json = fake_http_json
+        try:
+            out = eca.serpapi_search("Foo GmbH Köln Handelsregister", "KEY")
+        finally:
+            eca.http_json = orig
+        self.assertEqual(captured["method"], "GET")
+        self.assertIn("engine=google", captured["url"])
+        self.assertIn("hl=de", captured["url"])
+        self.assertEqual(out[0]["url"], "https://northdata.com/x")
+        self.assertIn("Amtsgericht Köln HRB 12345", out[0]["description"])
+        self.assertEqual(out[1]["url"], "")  # tolerant of missing fields
+
+    def test_serpapi_search_raises_on_non_200(self):
+        def fake(method, url, headers, body=None, timeout=60):
+            return 401, {"error": "invalid key"}
+
+        orig = eca.http_json
+        eca.http_json = fake
+        try:
+            with self.assertRaises(RuntimeError):
+                eca.serpapi_search("q", "BAD")
+        finally:
+            eca.http_json = orig
+
+    def test_serpapi_accepts_complete_snippet_without_scraping(self):
+        serp = [{"url": "https://northdata.com/foo", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Handel mit Möbeln.")}]
+        d = eca.process_company(
+            self._co(), serpapi_fn=lambda q: serp,
+            scrape_fn=self._no_scrape, translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.provider, "serpapi")
+        self.assertEqual(d.source, "aggregator")   # SerpApi rows are always aggregator
+        self.assertEqual(d.pass_used, "1")
+        self.assertEqual(d.scrape_tier, "")         # never scraped
+        self.assertEqual(d.serpapi_searches, 1)
+        self.assertEqual(d.credits, 0)              # no Firecrawl credits spent
+        self.assertEqual(d.purpose_raw, "Handel mit Möbeln.")
+
+    def test_serpapi_identity_gate_rejects_wrong_court(self):
+        # Same gate as Firecrawl: wrong court for the same HRB -> reject.
+        serp = [{"url": "https://northdata.com/x", "title": "Foo GmbH",
+                 "description": ("Amtsgericht München HRB 18311. Gegenstand des "
+                                 "Unternehmens: Hoch- und Tiefbau.")}]
+        d = eca.process_company(
+            self._co(court="Kassel", num="18311"), serpapi_fn=lambda q: serp,
+            scrape_fn=self._no_scrape, translate_fn=self._translate)
+        self.assertFalse(d.accepted)
+        self.assertIn("strict gate", d.reason)
+        self.assertEqual(d.serpapi_searches, 1)
+
+    def test_serpapi_empty_meaning_filter_applies(self):
+        # Complete snippet but a holding-shell purpose -> empty-meaning reject.
+        serp = [{"url": "https://northdata.com/shell", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Verwaltung eigenen Vermögens "
+                                 "ohne eigenen Geschäftsbetrieb.")}]
+        d = eca.process_company(
+            self._co(), serpapi_fn=lambda q: serp,
+            scrape_fn=self._no_scrape, translate_fn=self._echo_translate)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.reason, eca.EMPTY_MEANING_REASON)
+        self.assertEqual(d.provider, "serpapi")
+
+    def test_serpapi_truncated_falls_through_to_firecrawl(self):
+        # SerpApi snippet matches identity but purpose is truncated -> SerpApi
+        # does NOT win (no scraping); Firecrawl provides a complete snippet.
+        serp = [{"url": "https://northdata.com/foo", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Herstellung von …")}]
+        fire = [{"url": "https://northdata.com/foo2", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Herstellung von Maschinen.")}]
+        d = eca.process_company(
+            self._co(), serpapi_fn=lambda q: serp, search_fn=lambda q: fire,
+            scrape_fn=self._no_scrape, translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.provider, "firecrawl")
+        self.assertEqual(d.serpapi_searches, 1)
+        self.assertEqual(d.credits, 2)   # one Firecrawl search
+
+    def test_serpapi_only_truncated_is_rejected_and_recordable(self):
+        # SerpApi truncated + no Firecrawl provider -> reject, but the Decision
+        # still carries entity_id + reason so main() records the attempt (advance).
+        serp = [{"url": "https://northdata.com/foo", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Herstellung von …")}]
+        d = eca.process_company(
+            self._co(), serpapi_fn=lambda q: serp, translate_fn=self._translate)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.serpapi_searches, 1)
+        self.assertTrue(d.entity_id)
+        self.assertTrue(d.reason)        # recordable in company_activity_attempts
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,14 @@ German (``activity_de``) and faithfully translated to Arabic (``activity_ar``).
 
 Pipeline (validated by the spikes — see PR description)
 -------------------------------------------------------
-PASS 1  (cheap, ~2 credits per query)
+PASS 0  (SerpApi — real Google snippets, no scraping, free-tier)
+    **SerpApi SEARCH** ``"<name> <city> Handelsregister"`` (one search per
+    company) and read only the ``organic_results`` snippets. Feeds the SAME
+    identity gate below. Because SerpApi never scrapes, it accepts only when a
+    snippet already carries a usable (non-truncated) ``Gegenstand``; otherwise the
+    company falls through to PASS 1. SerpApi-derived rows store ``source='aggregator'``.
+
+PASS 1  (Firecrawl — cheap, ~2 credits per query; no-ops if credits are out)
     Firecrawl **SEARCH** a small set of query variants — ``"<name> <city>
     Handelsregister"``, ``"<name> <city> <TYPE>"``, ``"<name> <city>
     Gegenstand"``, ``"<name> <TYPE> <number>"`` — stopping at the first variant
@@ -57,8 +64,12 @@ Environment
 -----------
 * ``SUPABASE_URL``               — required (real run)
 * ``SUPABASE_SERVICE_ROLE_KEY``  — required (real run)
-* ``FIRECRAWL_API_KEY``          — required (real run)
 * ``OPENAI_API_KEY``             — required (real run)
+* ``SERPAPI_API_KEY``            — required when USE_SERPAPI=1 (PASS 0 provider)
+* ``FIRECRAWL_API_KEY``          — required when USE_FIRECRAWL=1 (PASS 1/2 provider)
+                                   At least one provider key must be present.
+* ``USE_SERPAPI``                — optional, default ``1`` (PASS 0 SerpApi on)
+* ``USE_FIRECRAWL``              — optional, default ``1`` (PASS 1/2 Firecrawl on)
 * ``MAX_COMPANIES``              — optional int, default 25 (the BATCH SIZE; each
                                    run processes up to this many NOT-yet-enriched
                                    companies, so reruns naturally resume)
@@ -456,6 +467,38 @@ def firecrawl_search(query: str, key: str, limit: int = 5) -> list[dict[str, str
     return out
 
 
+def serpapi_search(query: str, key: str, num: int = 10) -> list[dict[str, str]]:
+    """PASS 0: real Google snippets via SerpApi (NO page scraping).
+
+    Returns the SAME ``[{url, title, description}]`` shape as
+    :func:`firecrawl_search` so the existing snippet parser, identity gate and
+    empty-meaning filter are reused unchanged. Invoked with the canonical
+    ``"<name> <city> Handelsregister"`` query (one search per company). German
+    locale (``hl=de``/``gl=de``) so registry snippets surface.
+    """
+    url = "https://serpapi.com/search.json?" + parse.urlencode({
+        "engine": "google", "q": query, "num": num,
+        "hl": "de", "gl": "de", "api_key": key,
+    })
+    status, payload = http_json("GET", url, {"Accept": "application/json"},
+                                timeout=60)
+    if status != 200 or not isinstance(payload, dict):
+        raise RuntimeError(f"serpapi search {status}: {str(payload)[:200]}")
+    out: list[dict[str, str]] = []
+    for r in (payload.get("organic_results") or []):
+        out.append({
+            "url": r.get("link") or "",
+            "title": r.get("title") or "",
+            # 'snippet' is the Google result description; some results also carry
+            # a richer 'snippet_highlighted_words' list which we fold in for recall.
+            "description": " ".join(filter(None, [
+                r.get("snippet") or "",
+                " ".join(r.get("snippet_highlighted_words") or []),
+            ])).strip(),
+        })
+    return out
+
+
 def firecrawl_scrape(url: str, key: str, *, stealth: bool = False) -> str:
     """Pass 2: scrape ONE allow-listed page; returns markdown text.
 
@@ -526,7 +569,7 @@ class Decision:
                  "confidence", "source_ref", "matched_hrb", "purpose_de",
                  "purpose_ar", "purpose_raw", "credits", "matched_variant",
                  "pass_used", "court_matched", "scrape_tier", "normal_credits",
-                 "stealth_credits")
+                 "stealth_credits", "provider", "serpapi_searches")
 
     def __init__(self, entity_id: str, name: str) -> None:
         self.entity_id = entity_id
@@ -547,6 +590,8 @@ class Decision:
         self.scrape_tier = ""       # which pass-2 tier succeeded: "A"/"B"/"C"
         self.normal_credits = 0     # 1-credit scrapes spent on this company
         self.stealth_credits = 0    # 5-credit Stealth scrapes spent on this company
+        self.provider = ""          # snippet provider that matched: "serpapi"/"firecrawl"
+        self.serpapi_searches = 0   # SerpApi searches spent on this company
 
 
 def build_query_variants(name: str, city: str, reg_type: str,
@@ -572,18 +617,37 @@ def build_query_variants(name: str, city: str, reg_type: str,
     return variants
 
 
+def _snippets_have_complete_purpose(
+        found: list[tuple[dict[str, str], bool]]) -> bool:
+    """True if any matched snippet already yields a non-truncated Gegenstand.
+
+    SerpApi is snippet-only (no scraping), so it may only "win" pass 0 when the
+    snippets themselves carry a usable purpose; otherwise we fall through to the
+    Firecrawl path (which can recover a truncated purpose by scraping in pass 2).
+    """
+    for r, _ in found:
+        blob = f"{r.get('title', '')} {r.get('description', '')}"
+        g = extract_gegenstand(blob)
+        if g and not is_truncated(g):
+            return True
+    return False
+
+
 def process_company(co: dict[str, Any], *,
-                    search_fn: Callable[[str], list[dict[str, str]]],
-                    scrape_fn: Callable[..., str],
                     translate_fn: Callable[[str], tuple[str, str]],
+                    serpapi_fn: Optional[Callable[[str], list[dict[str, str]]]] = None,
+                    search_fn: Optional[Callable[[str], list[dict[str, str]]]] = None,
+                    scrape_fn: Optional[Callable[..., str]] = None,
                     allow_stealth: bool = True) -> Decision:
-    """Run pass 1 + gate (+ tiered pass 2) + translate for one company.
+    """Run pass 0/1 snippet gate (+ tiered pass 2) + translate for one company.
 
     ``co`` needs: entity_id, debtor_name, debtor_city, registry_court,
-    registry_type, registry_number. ``scrape_fn`` is called as
-    ``scrape_fn(url, stealth=<bool>)``. ``allow_stealth`` gates the 5-credit
-    pass-2 Tier-C fallback. Returns a :class:`Decision` describing the
-    accept/reject outcome and (when accepted) the payload to UPSERT.
+    registry_type, registry_number. Snippet providers are tried in order —
+    ``serpapi_fn`` (PASS 0, snippet-only, no scraping) then ``search_fn``
+    (Firecrawl PASS 1) — both feeding the SAME strict identity gate. ``scrape_fn``
+    (called as ``scrape_fn(url, stealth=<bool>)``) drives the Firecrawl-only pass
+    2; ``allow_stealth`` gates its 5-credit Tier-C fallback. Returns a
+    :class:`Decision` describing the accept/reject outcome and the UPSERT payload.
     """
     name = (co.get("debtor_name") or "").strip()
     city = (co.get("debtor_city") or "").strip()
@@ -596,21 +660,43 @@ def process_company(co: dict[str, Any], *,
         d.reason = "missing name/registry_number/registry_court"
         return d
 
-    # --- PASS 1: try query variants, stop at the first that yields an identity
-    #     match. The strict gate (identity_match) is UNCHANGED.
+    # --- PASS 0 (SerpApi snippets) then PASS 1 (Firecrawl snippets): both feed
+    #     the SAME strict identity gate (identity_match is UNCHANGED). Providers
+    #     are tried in order; the first to yield an identity match wins. SerpApi
+    #     is snippet-only (NO scraping), so it wins only when its snippets already
+    #     carry a usable (non-truncated) Gegenstand; otherwise we fall through to
+    #     Firecrawl (which can recover a truncated purpose by scraping in pass 2).
+    #     Frugal: SerpApi does ONE search ("<name> <city> Handelsregister").
+    variants = build_query_variants(name, city, reg_type, reg_num)
+    providers: list[tuple[str, Callable[[str], list[dict[str, str]]], list[str]]] = []
+    if serpapi_fn is not None:
+        providers.append(("serpapi", serpapi_fn, variants[:1]))
+    if search_fn is not None:
+        providers.append(("firecrawl", search_fn, variants))
+
     matched: list[tuple[dict[str, str], bool]] = []  # (result, court_ok)
-    for variant in build_query_variants(name, city, reg_type, reg_num):
-        results = search_fn(variant)
-        d.credits += 2  # a Firecrawl search is ~2 credits
-        found: list[tuple[dict[str, str], bool]] = []
-        for r in results:
-            blob = f"{r.get('title','')} {r.get('description','')}"
-            ok, court_ok = identity_match(blob, reg_type, reg_num, reg_court)
-            if ok:
-                found.append((r, court_ok))
-        if found:
+    for label, sfn, provider_variants in providers:
+        for variant in provider_variants:
+            results = sfn(variant)
+            if label == "firecrawl":
+                d.credits += 2           # a Firecrawl search is ~2 credits
+            else:
+                d.serpapi_searches += 1  # SerpApi search (free-tier, no credits)
+            found: list[tuple[dict[str, str], bool]] = []
+            for r in results:
+                blob = f"{r.get('title','')} {r.get('description','')}"
+                ok, court_ok = identity_match(blob, reg_type, reg_num, reg_court)
+                if ok:
+                    found.append((r, court_ok))
+            if not found:
+                continue
+            if label == "serpapi" and not _snippets_have_complete_purpose(found):
+                continue  # snippet-only: no usable purpose -> let Firecrawl try
             d.matched_variant = variant
+            d.provider = label
             matched = found
+            break
+        if matched:
             break
 
     if not matched:
@@ -619,11 +705,12 @@ def process_company(co: dict[str, Any], *,
 
     court_matched = any(court_ok for _, court_ok in matched)
 
-    # Best snippet purpose (longest) + the URL it came from; plus ALL identity-
-    # matched scrapable targets, de-duplicated and ordered least-risk first for
-    # the tiered pass-2 escalation below.
-    snippet_purpose: Optional[str] = None
-    purpose_url = ""
+    # Best snippet purpose + the URL it came from; plus ALL identity-matched
+    # scrapable targets, de-duplicated and ordered least-risk first for the tiered
+    # pass-2 escalation below. Prefer a COMPLETE (non-truncated) clause over a
+    # longer truncated one — this is what lets a SerpApi snippet accept without
+    # scraping when it already carries a full Gegenstand.
+    best: Optional[tuple[bool, int, str, str]] = None  # (complete, len, clause, url)
     first_url = ""
     ranked: list[tuple[int, str]] = []
     seen_urls: set[str] = set()
@@ -633,9 +720,10 @@ def process_company(co: dict[str, Any], *,
             first_url = url
         blob = f"{r.get('title','')} {r.get('description','')}"
         cand = extract_gegenstand(blob)
-        if cand and (snippet_purpose is None or len(cand) > len(snippet_purpose)):
-            snippet_purpose = cand
-            purpose_url = url
+        if cand:
+            key = (not is_truncated(cand), len(cand))
+            if best is None or key > (best[0], best[1]):
+                best = (key[0], key[1], cand, url)
         rank = scrape_rank(url)
         if rank is not None and url not in seen_urls:
             seen_urls.add(url)
@@ -643,9 +731,8 @@ def process_company(co: dict[str, Any], *,
     ranked.sort(key=lambda t: t[0])
     scrape_targets = [u for _, u in ranked]
 
-    purpose = snippet_purpose
-    if not purpose_url:
-        purpose_url = first_url
+    purpose = best[2] if best else None
+    purpose_url = best[3] if best else first_url
     d.pass_used = "1"
 
     # --- PASS 2 (tiered): only when identity matched but the snippet purpose is
@@ -681,7 +768,10 @@ def process_company(co: dict[str, Any], *,
         return {"status": "ok", "purpose": full, "hrb": hrb,
                 "court_ok": court_ok, "url": url}
 
-    if is_truncated(purpose):
+    # PASS 2 is Firecrawl-only: SerpApi never scrapes. Skip it entirely for a
+    # SerpApi win (which already has a complete purpose) or when no scraper is
+    # configured (Firecrawl disabled / credits out).
+    if is_truncated(purpose) and d.provider != "serpapi" and scrape_fn is not None:
         if scrape_targets:
             primary = scrape_targets[0]
             try:
@@ -751,7 +841,9 @@ def process_company(co: dict[str, Any], *,
 
     d.accepted = True
     d.reason = "accepted"
-    d.source = source_class(purpose_url)
+    # SerpApi-derived rows are snippet-only -> always 'aggregator' (per the brief);
+    # the Firecrawl path classifies by the page domain that supplied the purpose.
+    d.source = "aggregator" if d.provider == "serpapi" else source_class(purpose_url)
     # high only when number+court matched; a pass-2 page that lacked the HRB was
     # trusted from pass 1 but cannot earn 'high' here -> cap at medium.
     if d.pass_used == "2" and pass2_hrb == "absent":
@@ -1218,19 +1310,37 @@ def main() -> int:
     # Skip companies attempted within this window so the backfill ADVANCES.
     retry_after_days = int(os.environ.get("RETRY_AFTER_DAYS",
                                           str(DEFAULT_RETRY_AFTER_DAYS)))
+    # Snippet providers. SerpApi (PASS 0) is ON by default; Firecrawl (PASS 1) is
+    # ON by default but no-ops gracefully when its credits are exhausted. Either
+    # may be disabled via its flag — at least one must be enabled with a key.
+    use_serpapi = truthy(os.environ.get("USE_SERPAPI", "1"))
+    use_firecrawl = truthy(os.environ.get("USE_FIRECRAWL", "1"))
 
-    have_secrets = all(os.environ.get(k, "").strip() for k in (
-        "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
-        "FIRECRAWL_API_KEY", "OPENAI_API_KEY"))
+    serpapi_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+    fire_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    serpapi_on = use_serpapi and bool(serpapi_key)
+    firecrawl_on = use_firecrawl and bool(fire_key)
+
+    # Real run needs Supabase + OpenAI always, and at least one snippet provider.
+    have_secrets = (
+        all(os.environ.get(k, "").strip() for k in (
+            "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "OPENAI_API_KEY"))
+        and (serpapi_on or firecrawl_on))
 
     # Offline structural dry run when secrets are absent (local checkout).
     if dry and not have_secrets:
         return run_mock_dry_run(max_companies)
 
+    if not (serpapi_on or firecrawl_on):
+        print("[config] no snippet provider available: set SERPAPI_API_KEY "
+              "(USE_SERPAPI=1) and/or FIRECRAWL_API_KEY (USE_FIRECRAWL=1)",
+              file=sys.stderr)
+        return 2
+
     base = need("SUPABASE_URL").rstrip("/")
     skey = need("SUPABASE_SERVICE_ROLE_KEY")
-    fkey = need("FIRECRAWL_API_KEY")
     okey = need("OPENAI_API_KEY")
+    fkey = fire_key  # may be "" when Firecrawl is disabled / out of credits
     start = time.monotonic()
     now = datetime.now(timezone.utc)
 
@@ -1256,10 +1366,19 @@ def main() -> int:
     print(f"[start] {total} candidate companies (dry_run={dry}, "
           f"max_companies={max_companies}, allow_stealth={allow_stealth}, "
           f"order={order}, retry_after_days={retry_after_days}, "
+          f"serpapi={'on' if serpapi_on else 'off'}, "
+          f"firecrawl={'on' if firecrawl_on else 'off'}, "
           f"attempts_ledger={'on' if attempts_ok else 'ABSENT'})")
+
+    serpapi_fn = (lambda q: serpapi_search(q, serpapi_key)) if serpapi_on else None
+    search_fn = (lambda q: firecrawl_search(q, fkey)) if firecrawl_on else None
+    scrape_fn = ((lambda u, stealth=False: firecrawl_scrape(u, fkey, stealth=stealth))
+                 if firecrawl_on else None)
 
     processed = accepted = rejected = written = credits = 0
     normal_credits = stealth_credits = newly_attempted = 0
+    serpapi_searches = 0
+    provider_accepts: Counter[str] = Counter()
     tiers = {"A": 0, "B": 0, "C": 0}
     reject_reasons: Counter[str] = Counter()
 
@@ -1287,9 +1406,9 @@ def main() -> int:
         try:
             d = process_company(
                 co,
-                search_fn=lambda q: firecrawl_search(q, fkey),
-                scrape_fn=lambda u, stealth=False: firecrawl_scrape(
-                    u, fkey, stealth=stealth),
+                serpapi_fn=serpapi_fn,
+                search_fn=search_fn,
+                scrape_fn=scrape_fn,
                 translate_fn=lambda p: openai_translate(p, okey),
                 allow_stealth=allow_stealth)
         except Exception as e:  # noqa: BLE001 — never let one company kill the run
@@ -1302,15 +1421,18 @@ def main() -> int:
         credits += d.credits
         normal_credits += d.normal_credits
         stealth_credits += d.stealth_credits
+        serpapi_searches += d.serpapi_searches
         if d.scrape_tier in tiers:
             tiers[d.scrape_tier] += 1
+        if d.accepted and d.provider:
+            provider_accepts[d.provider] += 1
 
         court_tag = "court+num" if d.court_matched else "num-only"
         tier_tag = f"tier={d.scrape_tier}" if d.scrape_tier else "tier=-"
-        trace = (f"variant={d.matched_variant!r} match={court_tag} "
-                 f"pass={d.pass_used or '-'} {tier_tag} "
+        trace = (f"prov={d.provider or '-'} variant={d.matched_variant!r} "
+                 f"match={court_tag} pass={d.pass_used or '-'} {tier_tag} "
                  f"credits~{d.credits} (norm={d.normal_credits} "
-                 f"stealth={d.stealth_credits})")
+                 f"stealth={d.stealth_credits} serp={d.serpapi_searches})")
         if not d.accepted:
             rejected += 1
             reject_reasons[(d.reason or "unknown").strip().rstrip(";").strip()] += 1
@@ -1347,9 +1469,12 @@ def main() -> int:
           f"newly_attempted={newly_attempted} processed={processed} "
           f"accepted={accepted} written={written} rejected={rejected} "
           f"empty_meaning_skipped={empty_meaning} dry_run={dry}")
+    print(f"[summary] provider accepts: serpapi={provider_accepts.get('serpapi', 0)} "
+          f"firecrawl={provider_accepts.get('firecrawl', 0)} "
+          f"| serpapi searches used={serpapi_searches}")
     print(f"[summary] pass2 tiers A={tiers['A']} B={tiers['B']} C={tiers['C']}")
     print(f"[summary] credits total={credits} "
-          f"(scrape normal={normal_credits}, scrape stealth={stealth_credits})")
+          f"(firecrawl scrape normal={normal_credits}, stealth={stealth_credits})")
     if reject_reasons:
         print("[summary] rejected-by-reason:")
         for reason, n in reject_reasons.most_common():
