@@ -14,8 +14,10 @@ Run with:  python -m unittest discover -s tests
 """
 
 import os
+import re
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
@@ -710,6 +712,138 @@ class TestFetchCandidatesResume(unittest.TestCase):
         finally:
             eca.postgrest = orig
         self.assertIn("order=announcement_date.desc", captured["view_path"])
+
+
+class TestAttemptsLedger(unittest.TestCase):
+    """The attempts ledger that makes the backfill ADVANCE past rejected heads."""
+
+    def test_parse_ts_handles_z_and_offset_and_blank(self):
+        self.assertIsNotNone(eca.parse_ts("2026-06-30T00:00:00Z"))
+        self.assertIsNotNone(eca.parse_ts("2026-06-30T00:00:00+00:00"))
+        self.assertIsNone(eca.parse_ts(""))
+        self.assertIsNone(eca.parse_ts("not-a-date"))
+
+    def test_recently_attempted_window(self):
+        now = datetime(2026, 6, 30, tzinfo=timezone.utc)
+        amap = {
+            "fresh": {"attempts": 1,
+                      "last_attempt_at": (now - timedelta(days=5)).isoformat()},
+            "stale": {"attempts": 2,
+                      "last_attempt_at": (now - timedelta(days=40)).isoformat()},
+            "blank": {"attempts": 1, "last_attempt_at": ""},
+        }
+        recent = eca.recently_attempted(amap, 30, now)
+        self.assertEqual(recent, {"fresh"})  # stale (40d) is retryable again
+
+    def test_retry_after_zero_disables_window(self):
+        now = datetime(2026, 6, 30, tzinfo=timezone.utc)
+        amap = {"fresh": {"attempts": 1,
+                          "last_attempt_at": now.isoformat()}}
+        self.assertEqual(eca.recently_attempted(amap, 0, now), set())
+
+    def test_load_attempts_graceful_when_table_absent(self):
+        def boom(*a, **k):
+            raise RuntimeError("relation \"company_activity_attempts\" does not exist")
+
+        orig = eca.postgrest
+        eca.postgrest = boom
+        try:
+            amap, ok = eca.load_attempts("b", "k")
+        finally:
+            eca.postgrest = orig
+        self.assertEqual(amap, {})
+        self.assertFalse(ok)
+
+    def test_load_attempts_parses_rows(self):
+        rows = [{"entity_id": "e1", "attempts": 3,
+                 "last_attempt_at": "2026-06-01T00:00:00+00:00"}]
+
+        def fake(method, path, base, key, body=None, prefer=None):
+            return rows
+
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            amap, ok = eca.load_attempts("b", "k")
+        finally:
+            eca.postgrest = orig
+        self.assertTrue(ok)
+        self.assertEqual(amap["e1"]["attempts"], 3)
+
+    def test_upsert_attempt_builds_minimal_idempotent_row(self):
+        captured = {}
+
+        def fake(method, path, base, key, body=None, prefer=None):
+            captured.update(path=path, body=body, prefer=prefer)
+            return None
+
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            eca.upsert_attempt("b", "k", "e9", 4, "some reason")
+        finally:
+            eca.postgrest = orig
+        row = captured["body"][0]
+        self.assertEqual(set(row), {"entity_id", "attempts",
+                                    "last_attempt_at", "last_reason"})
+        self.assertEqual(row["entity_id"], "e9")
+        self.assertEqual(row["attempts"], 4)
+        self.assertIn("on_conflict=entity_id", captured["path"])
+        self.assertIn("merge-duplicates", captured["prefer"])
+
+
+class TestFetchCandidatesAdvance(unittest.TestCase):
+    """fetch_candidates must skip recently-attempted AND advance across pages."""
+
+    def test_excludes_recently_attempted_and_selects_new(self):
+        view_rows = [{"entity_id": f"e{i}", "debtor_name": f"C{i}"}
+                     for i in range(6)]
+        existing = [{"entity_id": "e0"}, {"entity_id": "e1"}]
+
+        def fake(method, path, base, key, body=None, prefer=None):
+            if path.startswith(eca.ACTIVITY_TABLE):
+                return existing
+            return view_rows  # < page size -> single page
+
+        stats: dict = {}
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            out = eca.fetch_candidates("b", "k", max_companies=2, fetch_limit=100,
+                                       exclude={"e2", "e3"}, stats=stats)
+        finally:
+            eca.postgrest = orig
+        ids = [r["entity_id"] for r in out]
+        self.assertEqual(ids, ["e4", "e5"])      # advanced past enriched + recent
+        self.assertEqual(stats["skipped_recent"], 2)
+
+    def test_pagination_advances_past_attempted_head(self):
+        # The bug: the entire head is unrecoverable. With small pages, selection
+        # must page THROUGH the attempted head to reach fresh companies.
+        all_rows = [{"entity_id": f"e{i}", "debtor_name": f"C{i}"}
+                    for i in range(6)]
+
+        def fake(method, path, base, key, body=None, prefer=None):
+            if path.startswith(eca.ACTIVITY_TABLE):
+                return []
+            off = int(re.search(r"offset=(\d+)", path).group(1))
+            lim = int(re.search(r"limit=(\d+)", path).group(1))
+            return all_rows[off:off + lim]
+
+        stats: dict = {}
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            out = eca.fetch_candidates(
+                "b", "k", max_companies=2, fetch_limit=2,   # 2 rows per page
+                exclude={"e0", "e1", "e2", "e3"},           # whole head attempted
+                stats=stats)
+        finally:
+            eca.postgrest = orig
+        ids = [r["entity_id"] for r in out]
+        self.assertEqual(ids, ["e4", "e5"])     # reached fresh companies on page 3
+        self.assertEqual(stats["skipped_recent"], 4)
+        self.assertGreaterEqual(stats["scanned"], 6)
 
 
 if __name__ == "__main__":
