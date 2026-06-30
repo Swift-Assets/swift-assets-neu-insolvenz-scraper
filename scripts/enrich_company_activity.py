@@ -59,8 +59,15 @@ Environment
 * ``SUPABASE_SERVICE_ROLE_KEY``  — required (real run)
 * ``FIRECRAWL_API_KEY``          — required (real run)
 * ``OPENAI_API_KEY``             — required (real run)
-* ``MAX_COMPANIES``              — optional int, default 25 (small by design)
+* ``MAX_COMPANIES``              — optional int, default 25 (the BATCH SIZE; each
+                                   run processes up to this many NOT-yet-enriched
+                                   companies, so reruns naturally resume)
 * ``CANDIDATE_FETCH_LIMIT``      — optional int, default 1000 (work-list window)
+* ``ORDER``                      — optional, default ``entity_id.asc`` (one of
+                                   entity_id.asc/desc, announcement_date.asc/desc).
+                                   Deterministic scan order for resumable batches.
+* ``ALLOW_STEALTH``              — optional, default ``0`` (OFF). ``1`` enables the
+                                   5-credit pass-2 Tier-C Stealth fallback.
 * ``REQUEST_PAUSE_SECONDS``      — optional float, default 1.0 (politeness)
 * ``TIME_BUDGET_SECONDS``        — optional float, default 3300 (stop before the
                                    60-min job timeout)
@@ -84,6 +91,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib import error, parse, request
@@ -119,6 +127,32 @@ PASS2_REASON = {
     "mismatch": "pass2: HRB re-verify failed",
     "no_gegenstand": "pass2: no Gegenstand label found on page",
 }
+
+# FIX 1 — small, explicit blocklist of "no determinable activity / shell / no
+# data" boilerplate. Applied to the TRANSLATED activity (DE or AR) so such rows
+# are never stored. Keep this list small and err toward STORING a real activity:
+# legitimate purposes like plain "Vermögensverwaltung" (asset management) must
+# NOT be blocked — only the explicit shell phrasing ("ohne eigenen
+# Geschäftsbetrieb") is. Matched as case-insensitive substrings.
+EMPTY_MEANING_DE = (
+    "kein operativer geschäftsbetrieb",     # no operative business
+    "kein geschäftsbetrieb feststellbar",   # no business determinable
+    "keine geschäftstätigkeit",             # no business activity
+    "keine angabe",                         # no data (covers "keine Angaben")
+    "nicht ermittelbar",                    # not ascertainable
+    "nicht feststellbar",                   # not determinable
+    "ohne eigenen geschäftsbetrieb",        # holding shell: no own operations
+    "ohne operativen geschäftsbetrieb",     # holding shell: no operative business
+)
+EMPTY_MEANING_AR = (
+    "لا يمكن تحديد",      # "cannot determine ..."
+    "لا يوجد نشاط",       # "there is no activity"
+    "لا توجد معلومات",    # "there is no information"
+    "غير محدد",          # "undetermined / unspecified"
+)
+
+# Reason recorded when a translated activity is rejected by the FIX-1 filter.
+EMPTY_MEANING_REASON = "empty-meaning activity (not stored)"
 
 # unternehmensregister.de is the official, free registry portal. It stays the
 # preferred pass-2 scrape target and drives source='unternehmensregister'.
@@ -369,6 +403,24 @@ def is_truncated(purpose: Optional[str]) -> bool:
     # Snippets are ~160 chars; a real Gegenstand that doesn't end on a sentence
     # boundary and is short is almost certainly cut off mid-text.
     if len(p) < 60 and not p.endswith((".", "!", ";")):
+        return True
+    return False
+
+
+def is_empty_meaning(activity_de: str, activity_ar: str) -> bool:
+    """True when the TRANSLATED activity carries no real business activity.
+
+    Catches empty strings and the small DE/AR blocklist of "no determinable
+    activity / shell / no data" boilerplate (see EMPTY_MEANING_*), so such rows
+    are rejected and never stored. Errs toward storing a genuine activity.
+    """
+    de = (activity_de or "").strip().lower()
+    ar = (activity_ar or "").strip()
+    if not de or not ar:
+        return True
+    if any(p in de for p in EMPTY_MEANING_DE):
+        return True
+    if any(p in ar for p in EMPTY_MEANING_AR):
         return True
     return False
 
@@ -677,6 +729,16 @@ def process_company(co: dict[str, Any], *,
     # --- translate (never invent) and finalise the accept.
     purpose = purpose.strip()
     de, ar = translate_fn(purpose)
+
+    # FIX 1 — reject "empty-meaning" activities AFTER translation so we never
+    # store a no-activity / shell / no-data boilerplate row (no invention, but
+    # no useless rows either). matched_hrb/source_ref are kept for the log only.
+    if is_empty_meaning(de, ar):
+        d.reason = EMPTY_MEANING_REASON
+        d.matched_hrb = reg_num
+        d.source_ref = purpose_url or f"{reg_type} {reg_num} / {reg_court}"
+        return d
+
     d.accepted = True
     d.reason = "accepted"
     d.source = source_class(purpose_url)
@@ -697,9 +759,31 @@ def process_company(co: dict[str, Any], *,
 # --------------------------------------------------------------------------- #
 #  Candidate selection + upsert
 # --------------------------------------------------------------------------- #
+# Allowed PostgREST order clauses for ORDER (kept to a safe, deterministic set
+# so successive backfill batches process a stable sequence). 'entity_id.asc' is
+# the default — fully deterministic and unaffected by new announcements arriving
+# between batches.
+ALLOWED_ORDERS = (
+    "entity_id.asc", "entity_id.desc",
+    "announcement_date.desc", "announcement_date.asc",
+)
+DEFAULT_ORDER = "entity_id.asc"
+
+
 def fetch_candidates(base: str, key: str, max_companies: int,
-                     fetch_limit: int) -> list[dict[str, Any]]:
-    """Distinct company entities with a registry, not yet in the activity table."""
+                     fetch_limit: int, order: str = DEFAULT_ORDER) -> list[dict[str, Any]]:
+    """Company entities with a registry that have NO row yet in the activity table.
+
+    RESUME: every run excludes entity_ids already present in
+    ``company_activity_sources`` and returns at most ``max_companies`` (the batch
+    size), so reruns naturally advance through the backlog without reprocessing.
+    ``order`` (validated against :data:`ALLOWED_ORDERS`) makes the scan order
+    deterministic so successive batches don't keep re-scanning the same head.
+    """
+    if order not in ALLOWED_ORDERS:
+        print(f"[warn] ORDER {order!r} not allowed; using {DEFAULT_ORDER!r}",
+              file=sys.stderr)
+        order = DEFAULT_ORDER
     cols = ("entity_id,debtor_name,debtor_city,registry_court,"
             "registry_type,registry_number,announcement_date")
     path = (
@@ -708,7 +792,7 @@ def fetch_candidates(base: str, key: str, max_companies: int,
         "&entity_id=not.is.null"
         "&registry_number=not.is.null"
         "&registry_court=not.is.null"
-        "&order=announcement_date.desc"
+        f"&order={order}"
         f"&limit={fetch_limit}"
     )
     rows = postgrest("GET", path, base, key) or []
@@ -732,6 +816,10 @@ def fetch_candidates(base: str, key: str, max_companies: int,
         out.append(r)
         if len(out) >= max_companies:
             break
+    # RESUME visibility: how many already-done were skipped vs. selected now.
+    print(f"[resume] {len(already)} entity(ies) already enriched (skipped); "
+          f"selected {len(out)} new (batch size MAX_COMPANIES={max_companies}, "
+          f"order={order})")
     return out
 
 
@@ -780,7 +868,8 @@ def upsert_activity(base: str, key: str, d: Decision) -> Any:
 #   accept via pass-2 with HRB ABSENT on the page + 'Tätigkeit' label (medium),
 #   accept via pass-2 TIER C (normal scrape bot-walled -> Stealth recovers it),
 #   reject (wrong court — same name, different company),
-#   reject (no registry token in any snippet).
+#   reject (no registry token in any snippet),
+#   reject (FIX 1 empty-meaning: holding-shell purpose, not stored).
 MOCK_SAMPLE: list[dict[str, Any]] = [
     {
         "company": {
@@ -921,6 +1010,23 @@ MOCK_SAMPLE: list[dict[str, Any]] = [
                             "Öffnungszeiten.")}],
         "scrape": {},  # no registry token anywhere -> reject
     },
+    {
+        # Identity matches and a full purpose is parsed, but it is a holding-shell
+        # boilerplate ("ohne eigenen Geschäftsbetrieb") -> FIX 1 rejects it AFTER
+        # translation so no empty-meaning row is stored.
+        "company": {
+            "entity_id": "03c4d5e6-f7a8-49b0-c1d2-3e4f5a6b7c8d",
+            "debtor_name": "Schatten Holding UG", "debtor_city": "Berlin",
+            "registry_court": "Charlottenburg", "registry_type": "HRB",
+            "registry_number": "224488"},
+        "search": [{
+            "url": "https://northdata.com/Schatten+Holding",
+            "title": "Schatten Holding UG – HRB 224488",
+            "description": ("Amtsgericht Charlottenburg HRB 224488. Gegenstand "
+                            "des Unternehmens: Verwaltung des eigenen Vermögens "
+                            "ohne eigenen Geschäftsbetrieb.")}],
+        "scrape": {},
+    },
 ]
 
 
@@ -946,7 +1052,7 @@ def run_mock_dry_run(max_companies: int) -> int:
             return v.get("stealth", "") if stealth else v.get("normal", "")
         return v
 
-    accepted = rejected = 0
+    accepted = rejected = empty_meaning = 0
     total_credits = normal_credits = stealth_credits = 0
     tiers = {"A": 0, "B": 0, "C": 0}
     for i, item in enumerate(sample, 1):
@@ -963,6 +1069,8 @@ def run_mock_dry_run(max_companies: int) -> int:
         stealth_credits += d.stealth_credits
         if d.scrape_tier in tiers:
             tiers[d.scrape_tier] += 1
+        if d.reason == EMPTY_MEANING_REASON:
+            empty_meaning += 1
         court_tag = "court+num" if d.court_matched else "num-only"
         if d.accepted:
             accepted += 1
@@ -984,7 +1092,7 @@ def run_mock_dry_run(max_companies: int) -> int:
                   f"[variant={d.matched_variant!r} match={court_tag}]")
     print("-" * 74)
     print(f"[mock-dry-run] companies={len(sample)} accepted={accepted} "
-          f"rejected={rejected}")
+          f"rejected={rejected} empty_meaning_skipped={empty_meaning}")
     print(f"[mock-dry-run] tiers A={tiers['A']} B={tiers['B']} C={tiers['C']} "
           f"| credits total={total_credits} (norm={normal_credits} "
           f"stealth={stealth_credits})")
@@ -1001,7 +1109,11 @@ def main() -> int:
     fetch_limit = int(os.environ.get("CANDIDATE_FETCH_LIMIT", "1000"))
     pause = float(os.environ.get("REQUEST_PAUSE_SECONDS", "1.0"))
     time_budget = float(os.environ.get("TIME_BUDGET_SECONDS", "3300"))
-    allow_stealth = truthy(os.environ.get("ALLOW_STEALTH", "1"))
+    # Stealth (Tier C) is OFF by default — 5 credits/page for poor ROI at scale.
+    # Set ALLOW_STEALTH=1 to enable it for a targeted run.
+    allow_stealth = truthy(os.environ.get("ALLOW_STEALTH", "0"))
+    # Deterministic batch ordering for resumable backfills (see fetch_candidates).
+    order = os.environ.get("ORDER", DEFAULT_ORDER).strip() or DEFAULT_ORDER
 
     have_secrets = all(os.environ.get(k, "").strip() for k in (
         "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
@@ -1018,22 +1130,25 @@ def main() -> int:
     start = time.monotonic()
 
     try:
-        candidates = fetch_candidates(base, skey, max_companies, fetch_limit)
+        candidates = fetch_candidates(base, skey, max_companies, fetch_limit, order)
     except Exception as e:  # noqa: BLE001
         print(f"[fatal] cannot read candidates: {e}", file=sys.stderr)
         return 3
 
     total = len(candidates)
     print(f"[start] {total} candidate companies (dry_run={dry}, "
-          f"max_companies={max_companies}, allow_stealth={allow_stealth})")
+          f"max_companies={max_companies}, allow_stealth={allow_stealth}, "
+          f"order={order})")
 
-    accepted = rejected = written = credits = 0
+    processed = accepted = rejected = written = credits = 0
     normal_credits = stealth_credits = 0
     tiers = {"A": 0, "B": 0, "C": 0}
+    reject_reasons: Counter[str] = Counter()
     for i, co in enumerate(candidates, 1):
         if time.monotonic() - start > time_budget:
             print(f"[stop] time budget reached after {i - 1} companies")
             break
+        processed += 1
         name = (co.get("debtor_name") or "").strip()
         try:
             d = process_company(
@@ -1045,6 +1160,7 @@ def main() -> int:
                 allow_stealth=allow_stealth)
         except Exception as e:  # noqa: BLE001 — never let one company kill the run
             rejected += 1
+            reject_reasons[f"error: {type(e).__name__}"] += 1
             print(f"[{i}/{total}] ERROR  {name!r}: {e}")
             time.sleep(pause)
             continue
@@ -1062,6 +1178,7 @@ def main() -> int:
                  f"stealth={d.stealth_credits})")
         if not d.accepted:
             rejected += 1
+            reject_reasons[(d.reason or "unknown").strip().rstrip(";").strip()] += 1
             print(f"[{i}/{total}] REJECT {name!r}: {d.reason} [{trace}]")
             time.sleep(pause)
             continue
@@ -1080,14 +1197,23 @@ def main() -> int:
                 print(f"[{i}/{total}] WRITE  {name!r} -> source={d.source} "
                       f"conf={d.confidence} hrb={d.matched_hrb} [{trace}]")
             except Exception as e:  # noqa: BLE001
+                reject_reasons["write failed (db error)"] += 1
                 print(f"[{i}/{total}] WRITE FAILED {name!r}: {e}")
         time.sleep(pause)
 
-    print(f"[done] companies={total} accepted={accepted} rejected={rejected} "
-          f"written={written} dry_run={dry}")
-    print(f"[tiers] pass2 successes A={tiers['A']} B={tiers['B']} C={tiers['C']}")
-    print(f"[credits] total={credits} (scrape normal={normal_credits}, "
-          f"scrape stealth={stealth_credits})")
+    empty_meaning = reject_reasons.get(EMPTY_MEANING_REASON, 0)
+    print("=" * 74)
+    print(f"[summary] processed={processed} accepted={accepted} "
+          f"written={written} rejected={rejected} "
+          f"empty_meaning_skipped={empty_meaning} dry_run={dry}")
+    print(f"[summary] pass2 tiers A={tiers['A']} B={tiers['B']} C={tiers['C']}")
+    print(f"[summary] credits total={credits} "
+          f"(scrape normal={normal_credits}, scrape stealth={stealth_credits})")
+    if reject_reasons:
+        print("[summary] rejected-by-reason:")
+        for reason, n in reject_reasons.most_common():
+            print(f"    {n:5d}  {reason}")
+    print("=" * 74)
     return 0
 
 
