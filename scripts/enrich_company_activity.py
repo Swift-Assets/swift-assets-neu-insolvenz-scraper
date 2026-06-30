@@ -66,10 +66,15 @@ Environment
 * ``SUPABASE_SERVICE_ROLE_KEY``  — required (real run)
 * ``OPENAI_API_KEY``             — required (real run)
 * ``SERPAPI_API_KEY``            — required when USE_SERPAPI=1 (PASS 0 provider)
+* ``SERPER_API_KEY``             — required when USE_SERPER=1 (PASS 0 provider,
+                                   Serper.dev — distinct from SERPAPI_API_KEY)
 * ``FIRECRAWL_API_KEY``          — required when USE_FIRECRAWL=1 (PASS 1/2 provider)
                                    At least one provider key must be present.
 * ``USE_SERPAPI``                — optional, default ``1`` (PASS 0 SerpApi on)
+* ``USE_SERPER``                 — optional, default ``0`` (PASS 0 Serper.dev)
 * ``USE_FIRECRAWL``              — optional, default ``1`` (PASS 1/2 Firecrawl on)
+* ``SUMMARY_JSON_PATH``          — optional, default ``/tmp/enrich_summary.json``
+                                   (health-check summary for the daily email)
 * ``MAX_COMPANIES``              — optional int, default 25 (the BATCH SIZE; each
                                    run processes up to this many NOT-yet-enriched
                                    companies, so reruns naturally resume)
@@ -120,6 +125,20 @@ ACTIVITY_TABLE = "company_activity_sources"
 ATTEMPTS_TABLE = "company_activity_attempts"
 DEFAULT_RETRY_AFTER_DAYS = 30
 SOURCE_VIEW = "source_neu_insolvenz_announcements"
+
+# Snippet-only providers (real Google snippets, NO page scraping): they win pass 0
+# only with a complete in-snippet Gegenstand, never scrape, and store
+# source='aggregator'. Firecrawl is the only scraping provider.
+SNIPPET_ONLY_PROVIDERS = frozenset({"serpapi", "serper"})
+
+# PostgREST filters that define the eligible-company universe (used by candidate
+# selection AND by the coverage metrics in the health summary — single source).
+ELIGIBLE_FILTERS = (
+    "subject_type=eq.company"
+    "&entity_id=not.is.null"
+    "&registry_number=not.is.null"
+    "&registry_court=not.is.null"
+)
 
 # Exact writable columns of swift_v2.company_activity_sources. id/created_at/
 # updated_at are DB-managed and never sent; extracted_at we set explicitly.
@@ -499,6 +518,31 @@ def serpapi_search(query: str, key: str, num: int = 10) -> list[dict[str, str]]:
     return out
 
 
+def serper_search(query: str, key: str, num: int = 10) -> list[dict[str, str]]:
+    """PASS 0: real Google snippets via Serper.dev (NO page scraping).
+
+    POSTs ``{"q": query, "gl": "de", "hl": "de"}`` to
+    ``https://google.serper.dev/search`` with header ``X-API-KEY``. Maps
+    ``organic[]`` -> the SAME ``[{url, title, description}]`` shape as the other
+    snippet providers, so the existing identity gate / empty-meaning filter /
+    translation are reused unchanged. Distinct from SerpApi (SERPAPI_API_KEY).
+    """
+    status, payload = http_json(
+        "POST", "https://google.serper.dev/search",
+        {"X-API-KEY": key, "Content-Type": "application/json"},
+        {"q": query, "gl": "de", "hl": "de", "num": num}, timeout=60)
+    if status != 200 or not isinstance(payload, dict):
+        raise RuntimeError(f"serper search {status}: {str(payload)[:200]}")
+    out: list[dict[str, str]] = []
+    for r in (payload.get("organic") or []):
+        out.append({
+            "url": r.get("link") or "",
+            "title": r.get("title") or "",
+            "description": r.get("snippet") or "",
+        })
+    return out
+
+
 def firecrawl_scrape(url: str, key: str, *, stealth: bool = False) -> str:
     """Pass 2: scrape ONE allow-listed page; returns markdown text.
 
@@ -569,7 +613,8 @@ class Decision:
                  "confidence", "source_ref", "matched_hrb", "purpose_de",
                  "purpose_ar", "purpose_raw", "credits", "matched_variant",
                  "pass_used", "court_matched", "scrape_tier", "normal_credits",
-                 "stealth_credits", "provider", "serpapi_searches")
+                 "stealth_credits", "provider", "serpapi_searches",
+                 "serper_searches")
 
     def __init__(self, entity_id: str, name: str) -> None:
         self.entity_id = entity_id
@@ -590,8 +635,9 @@ class Decision:
         self.scrape_tier = ""       # which pass-2 tier succeeded: "A"/"B"/"C"
         self.normal_credits = 0     # 1-credit scrapes spent on this company
         self.stealth_credits = 0    # 5-credit Stealth scrapes spent on this company
-        self.provider = ""          # snippet provider that matched: "serpapi"/"firecrawl"
+        self.provider = ""          # matched provider: "serpapi"/"serper"/"firecrawl"
         self.serpapi_searches = 0   # SerpApi searches spent on this company
+        self.serper_searches = 0    # Serper.dev searches spent on this company
 
 
 def build_query_variants(name: str, city: str, reg_type: str,
@@ -636,6 +682,7 @@ def _snippets_have_complete_purpose(
 def process_company(co: dict[str, Any], *,
                     translate_fn: Callable[[str], tuple[str, str]],
                     serpapi_fn: Optional[Callable[[str], list[dict[str, str]]]] = None,
+                    serper_fn: Optional[Callable[[str], list[dict[str, str]]]] = None,
                     search_fn: Optional[Callable[[str], list[dict[str, str]]]] = None,
                     scrape_fn: Optional[Callable[..., str]] = None,
                     allow_stealth: bool = True) -> Decision:
@@ -643,11 +690,11 @@ def process_company(co: dict[str, Any], *,
 
     ``co`` needs: entity_id, debtor_name, debtor_city, registry_court,
     registry_type, registry_number. Snippet providers are tried in order —
-    ``serpapi_fn`` (PASS 0, snippet-only, no scraping) then ``search_fn``
-    (Firecrawl PASS 1) — both feeding the SAME strict identity gate. ``scrape_fn``
-    (called as ``scrape_fn(url, stealth=<bool>)``) drives the Firecrawl-only pass
-    2; ``allow_stealth`` gates its 5-credit Tier-C fallback. Returns a
-    :class:`Decision` describing the accept/reject outcome and the UPSERT payload.
+    ``serpapi_fn`` and ``serper_fn`` (PASS 0, snippet-only, no scraping) then
+    ``search_fn`` (Firecrawl PASS 1) — all feeding the SAME strict identity gate.
+    ``scrape_fn`` (called as ``scrape_fn(url, stealth=<bool>)``) drives the
+    Firecrawl-only pass 2; ``allow_stealth`` gates its 5-credit Tier-C fallback.
+    Returns a :class:`Decision` describing the outcome and the UPSERT payload.
     """
     name = (co.get("debtor_name") or "").strip()
     city = (co.get("debtor_city") or "").strip()
@@ -660,17 +707,19 @@ def process_company(co: dict[str, Any], *,
         d.reason = "missing name/registry_number/registry_court"
         return d
 
-    # --- PASS 0 (SerpApi snippets) then PASS 1 (Firecrawl snippets): both feed
-    #     the SAME strict identity gate (identity_match is UNCHANGED). Providers
-    #     are tried in order; the first to yield an identity match wins. SerpApi
-    #     is snippet-only (NO scraping), so it wins only when its snippets already
-    #     carry a usable (non-truncated) Gegenstand; otherwise we fall through to
-    #     Firecrawl (which can recover a truncated purpose by scraping in pass 2).
-    #     Frugal: SerpApi does ONE search ("<name> <city> Handelsregister").
+    # --- PASS 0 (SerpApi / Serper snippets) then PASS 1 (Firecrawl snippets):
+    #     all feed the SAME strict identity gate (identity_match is UNCHANGED).
+    #     Providers are tried in order; the first to yield an identity match wins.
+    #     The snippet-only providers (SNIPPET_ONLY_PROVIDERS) never scrape, so they
+    #     win only when their snippets already carry a usable (non-truncated)
+    #     Gegenstand; otherwise we fall through (Firecrawl can scrape in pass 2).
+    #     Frugal: each snippet provider does ONE search ("<name> <city> Handelsregister").
     variants = build_query_variants(name, city, reg_type, reg_num)
     providers: list[tuple[str, Callable[[str], list[dict[str, str]]], list[str]]] = []
     if serpapi_fn is not None:
         providers.append(("serpapi", serpapi_fn, variants[:1]))
+    if serper_fn is not None:
+        providers.append(("serper", serper_fn, variants[:1]))
     if search_fn is not None:
         providers.append(("firecrawl", search_fn, variants))
 
@@ -680,8 +729,10 @@ def process_company(co: dict[str, Any], *,
             results = sfn(variant)
             if label == "firecrawl":
                 d.credits += 2           # a Firecrawl search is ~2 credits
-            else:
+            elif label == "serpapi":
                 d.serpapi_searches += 1  # SerpApi search (free-tier, no credits)
+            else:                        # serper
+                d.serper_searches += 1   # Serper.dev search (free-tier, no credits)
             found: list[tuple[dict[str, str], bool]] = []
             for r in results:
                 blob = f"{r.get('title','')} {r.get('description','')}"
@@ -690,8 +741,9 @@ def process_company(co: dict[str, Any], *,
                     found.append((r, court_ok))
             if not found:
                 continue
-            if label == "serpapi" and not _snippets_have_complete_purpose(found):
-                continue  # snippet-only: no usable purpose -> let Firecrawl try
+            if (label in SNIPPET_ONLY_PROVIDERS
+                    and not _snippets_have_complete_purpose(found)):
+                continue  # snippet-only: no usable purpose -> let next provider try
             d.matched_variant = variant
             d.provider = label
             matched = found
@@ -768,10 +820,11 @@ def process_company(co: dict[str, Any], *,
         return {"status": "ok", "purpose": full, "hrb": hrb,
                 "court_ok": court_ok, "url": url}
 
-    # PASS 2 is Firecrawl-only: SerpApi never scrapes. Skip it entirely for a
-    # SerpApi win (which already has a complete purpose) or when no scraper is
+    # PASS 2 is Firecrawl-only: snippet-only providers never scrape. Skip it for a
+    # snippet-only win (already a complete purpose) or when no scraper is
     # configured (Firecrawl disabled / credits out).
-    if is_truncated(purpose) and d.provider != "serpapi" and scrape_fn is not None:
+    if (is_truncated(purpose) and d.provider not in SNIPPET_ONLY_PROVIDERS
+            and scrape_fn is not None):
         if scrape_targets:
             primary = scrape_targets[0]
             try:
@@ -841,9 +894,10 @@ def process_company(co: dict[str, Any], *,
 
     d.accepted = True
     d.reason = "accepted"
-    # SerpApi-derived rows are snippet-only -> always 'aggregator' (per the brief);
+    # Snippet-only providers (SerpApi/Serper) are 'aggregator' (per the brief);
     # the Firecrawl path classifies by the page domain that supplied the purpose.
-    d.source = "aggregator" if d.provider == "serpapi" else source_class(purpose_url)
+    d.source = ("aggregator" if d.provider in SNIPPET_ONLY_PROVIDERS
+                else source_class(purpose_url))
     # high only when number+court matched; a pass-2 page that lacked the HRB was
     # trusted from pass 1 but cannot earn 'high' here -> cap at medium.
     if d.pass_used == "2" and pass2_hrb == "absent":
@@ -962,11 +1016,7 @@ def fetch_candidates(base: str, key: str, max_companies: int, fetch_limit: int,
     skipped_recent = scanned = offset = 0
     while len(out) < max_companies:
         path = (
-            f"{SOURCE_VIEW}?select={cols}"
-            "&subject_type=eq.company"
-            "&entity_id=not.is.null"
-            "&registry_number=not.is.null"
-            "&registry_court=not.is.null"
+            f"{SOURCE_VIEW}?select={cols}&{ELIGIBLE_FILTERS}"
             f"&order={order}"
             f"&offset={offset}&limit={page}"
         )
@@ -1000,6 +1050,77 @@ def fetch_candidates(base: str, key: str, max_companies: int, fetch_limit: int,
           f"selected {len(out)} new (batch MAX_COMPANIES={max_companies}, "
           f"order={order})")
     return out
+
+
+def count_distinct_entity_ids(base: str, key: str, base_path: str,
+                              page: int = 1000) -> int:
+    """Count DISTINCT entity_ids for an entity_id-selecting PostgREST path.
+
+    Pages through ``base_path`` (which must ``select=entity_id``) and dedups, so a
+    view with multiple rows per company yields the true distinct count. Used only
+    by the daily health summary (coverage metrics), not the hot path.
+    """
+    seen: set[str] = set()
+    offset = 0
+    while True:
+        rows = postgrest("GET", f"{base_path}&offset={offset}&limit={page}",
+                         base, key) or []
+        if not rows:
+            break
+        for r in rows:
+            eid = r.get("entity_id")
+            if eid:
+                seen.add(eid)
+        if len(rows) < page:
+            break
+        offset += page
+    return len(seen)
+
+
+def build_summary(*, date: str, providers_used: list[str], processed: int,
+                  serper_searches: int, accepted: int, written: int,
+                  rejected: int, reject_reasons: Counter,
+                  high: int, medium: int, total_enriched_now: int,
+                  eligible_total: int, ok: bool = True, error: str = "",
+                  dry_run: bool = False) -> dict[str, Any]:
+    """Assemble the health-check summary dict (also written to JSON for the email).
+
+    Pure (no I/O) so the shape is unit-testable. ``coverage_percent`` =
+    total_enriched_now / eligible_total * 100 (0.0 when the denominator is 0).
+    """
+    coverage = (round(100.0 * total_enriched_now / eligible_total, 1)
+                if eligible_total else 0.0)
+    return {
+        "date": date,
+        "providers_used": providers_used,
+        "companies_processed": processed,
+        "serper_searches_used": serper_searches,
+        "accepted": accepted,
+        "written": written,
+        "rejected": rejected,
+        # list of [reason, count], most common first (JSON-friendly)
+        "rejected_by_reason": [[r, n] for r, n in reject_reasons.most_common(8)],
+        "high": high,
+        "medium": medium,
+        "total_enriched_now": total_enriched_now,
+        "eligible_total": eligible_total,
+        "coverage_percent": coverage,
+        "ok": ok,
+        "error": error,
+        "dry_run": dry_run,
+    }
+
+
+def write_summary(path: str, summary: dict[str, Any]) -> None:
+    """Write the summary JSON to ``path`` AND echo it to stdout (single line)."""
+    blob = json.dumps(summary, ensure_ascii=False)
+    print(f"[summary-json] {blob}")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(blob)
+    except OSError as e:  # noqa: BLE001 — reporting must not crash the worker
+        print(f"[warn] could not write summary JSON to {path}: {e}",
+              file=sys.stderr)
 
 
 def upsert_attempt(base: str, key: str, entity_id: str, attempts: int,
@@ -1310,31 +1431,41 @@ def main() -> int:
     # Skip companies attempted within this window so the backfill ADVANCES.
     retry_after_days = int(os.environ.get("RETRY_AFTER_DAYS",
                                           str(DEFAULT_RETRY_AFTER_DAYS)))
-    # Snippet providers. SerpApi (PASS 0) is ON by default; Firecrawl (PASS 1) is
-    # ON by default but no-ops gracefully when its credits are exhausted. Either
-    # may be disabled via its flag — at least one must be enabled with a key.
+    summary_path = os.environ.get("SUMMARY_JSON_PATH", "/tmp/enrich_summary.json")
+    run_date = datetime.now(timezone.utc).date().isoformat()
+    # Snippet providers. SerpApi (PASS 0) is ON by default; Serper (PASS 0) is OFF
+    # by default; Firecrawl (PASS 1) is ON by default but no-ops gracefully when its
+    # credits are exhausted. Each may be toggled via its flag — at least one must
+    # be enabled with a key.
     use_serpapi = truthy(os.environ.get("USE_SERPAPI", "1"))
+    use_serper = truthy(os.environ.get("USE_SERPER", "0"))
     use_firecrawl = truthy(os.environ.get("USE_FIRECRAWL", "1"))
 
     serpapi_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+    serper_key = os.environ.get("SERPER_API_KEY", "").strip()
     fire_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
     serpapi_on = use_serpapi and bool(serpapi_key)
+    serper_on = use_serper and bool(serper_key)
     firecrawl_on = use_firecrawl and bool(fire_key)
+    any_provider = serpapi_on or serper_on or firecrawl_on
+    providers_used = [p for p, on in (("serpapi", serpapi_on),
+                                      ("serper", serper_on),
+                                      ("firecrawl", firecrawl_on)) if on]
 
     # Real run needs Supabase + OpenAI always, and at least one snippet provider.
     have_secrets = (
         all(os.environ.get(k, "").strip() for k in (
             "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "OPENAI_API_KEY"))
-        and (serpapi_on or firecrawl_on))
+        and any_provider)
 
     # Offline structural dry run when secrets are absent (local checkout).
     if dry and not have_secrets:
         return run_mock_dry_run(max_companies)
 
-    if not (serpapi_on or firecrawl_on):
+    if not any_provider:
         print("[config] no snippet provider available: set SERPAPI_API_KEY "
-              "(USE_SERPAPI=1) and/or FIRECRAWL_API_KEY (USE_FIRECRAWL=1)",
-              file=sys.stderr)
+              "(USE_SERPAPI=1), SERPER_API_KEY (USE_SERPER=1) and/or "
+              "FIRECRAWL_API_KEY (USE_FIRECRAWL=1)", file=sys.stderr)
         return 2
 
     base = need("SUPABASE_URL").rstrip("/")
@@ -1356,6 +1487,13 @@ def main() -> int:
                                       order, exclude=recent, stats=sel_stats)
     except Exception as e:  # noqa: BLE001
         print(f"[fatal] cannot read candidates: {e}", file=sys.stderr)
+        # Emit a failure summary so the daily report still goes out.
+        write_summary(summary_path, build_summary(
+            date=run_date, providers_used=providers_used, processed=0,
+            serper_searches=0, accepted=0, written=0, rejected=0,
+            reject_reasons=Counter(), high=0, medium=0, total_enriched_now=0,
+            eligible_total=0, ok=False, error=f"cannot read candidates: {e}",
+            dry_run=dry))
         return 3
 
     total = len(candidates)
@@ -1367,18 +1505,21 @@ def main() -> int:
           f"max_companies={max_companies}, allow_stealth={allow_stealth}, "
           f"order={order}, retry_after_days={retry_after_days}, "
           f"serpapi={'on' if serpapi_on else 'off'}, "
+          f"serper={'on' if serper_on else 'off'}, "
           f"firecrawl={'on' if firecrawl_on else 'off'}, "
           f"attempts_ledger={'on' if attempts_ok else 'ABSENT'})")
 
     serpapi_fn = (lambda q: serpapi_search(q, serpapi_key)) if serpapi_on else None
+    serper_fn = (lambda q: serper_search(q, serper_key)) if serper_on else None
     search_fn = (lambda q: firecrawl_search(q, fkey)) if firecrawl_on else None
     scrape_fn = ((lambda u, stealth=False: firecrawl_scrape(u, fkey, stealth=stealth))
                  if firecrawl_on else None)
 
     processed = accepted = rejected = written = credits = 0
     normal_credits = stealth_credits = newly_attempted = 0
-    serpapi_searches = 0
+    serpapi_searches = serper_searches = 0
     provider_accepts: Counter[str] = Counter()
+    conf_counts: Counter[str] = Counter()
     tiers = {"A": 0, "B": 0, "C": 0}
     reject_reasons: Counter[str] = Counter()
 
@@ -1407,6 +1548,7 @@ def main() -> int:
             d = process_company(
                 co,
                 serpapi_fn=serpapi_fn,
+                serper_fn=serper_fn,
                 search_fn=search_fn,
                 scrape_fn=scrape_fn,
                 translate_fn=lambda p: openai_translate(p, okey),
@@ -1422,17 +1564,21 @@ def main() -> int:
         normal_credits += d.normal_credits
         stealth_credits += d.stealth_credits
         serpapi_searches += d.serpapi_searches
+        serper_searches += d.serper_searches
         if d.scrape_tier in tiers:
             tiers[d.scrape_tier] += 1
         if d.accepted and d.provider:
             provider_accepts[d.provider] += 1
+        if d.accepted and d.confidence:
+            conf_counts[d.confidence] += 1
 
         court_tag = "court+num" if d.court_matched else "num-only"
         tier_tag = f"tier={d.scrape_tier}" if d.scrape_tier else "tier=-"
         trace = (f"prov={d.provider or '-'} variant={d.matched_variant!r} "
                  f"match={court_tag} pass={d.pass_used or '-'} {tier_tag} "
                  f"credits~{d.credits} (norm={d.normal_credits} "
-                 f"stealth={d.stealth_credits} serp={d.serpapi_searches})")
+                 f"stealth={d.stealth_credits} serp={d.serpapi_searches} "
+                 f"serper={d.serper_searches})")
         if not d.accepted:
             rejected += 1
             reject_reasons[(d.reason or "unknown").strip().rstrip(";").strip()] += 1
@@ -1470,8 +1616,9 @@ def main() -> int:
           f"accepted={accepted} written={written} rejected={rejected} "
           f"empty_meaning_skipped={empty_meaning} dry_run={dry}")
     print(f"[summary] provider accepts: serpapi={provider_accepts.get('serpapi', 0)} "
+          f"serper={provider_accepts.get('serper', 0)} "
           f"firecrawl={provider_accepts.get('firecrawl', 0)} "
-          f"| serpapi searches used={serpapi_searches}")
+          f"| searches: serpapi={serpapi_searches} serper={serper_searches}")
     print(f"[summary] pass2 tiers A={tiers['A']} B={tiers['B']} C={tiers['C']}")
     print(f"[summary] credits total={credits} "
           f"(firecrawl scrape normal={normal_credits}, stealth={stealth_credits})")
@@ -1480,6 +1627,25 @@ def main() -> int:
         for reason, n in reject_reasons.most_common():
             print(f"    {n:5d}  {reason}")
     print("=" * 74)
+
+    # --- Health-check summary JSON (consumed by scripts/send_health_report.py).
+    # Coverage metrics are exact distinct-entity counts (daily, off the hot path).
+    enriched_path = f"{ACTIVITY_TABLE}?select=entity_id"
+    eligible_path = f"{SOURCE_VIEW}?select=entity_id&{ELIGIBLE_FILTERS}"
+    try:
+        total_enriched_now = count_distinct_entity_ids(base, skey, enriched_path)
+        eligible_total = count_distinct_entity_ids(base, skey, eligible_path)
+    except Exception as e:  # noqa: BLE001 — metrics must not fail the run
+        print(f"[warn] could not compute coverage metrics: {e}", file=sys.stderr)
+        total_enriched_now = eligible_total = 0
+
+    write_summary(summary_path, build_summary(
+        date=run_date, providers_used=providers_used, processed=processed,
+        serper_searches=serper_searches, accepted=accepted, written=written,
+        rejected=rejected, reject_reasons=reject_reasons,
+        high=conf_counts.get("high", 0), medium=conf_counts.get("medium", 0),
+        total_enriched_now=total_enriched_now, eligible_total=eligible_total,
+        ok=True, dry_run=dry))
     return 0
 
 

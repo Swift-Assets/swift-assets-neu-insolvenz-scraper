@@ -1,0 +1,63 @@
+name: Daily Enrichment Health Check (Serper)
+
+# Multi-week test: every day, enrich 50 companies using the Serper.dev snippet
+# provider (PASS 0, snippets only — no scraping), then email a health-check
+# report via SMTP. Idempotent + resumable via the attempts ledger; SerpApi and
+# Firecrawl are OFF here so this run is Serper-only.
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      max_companies:
+        description: "Companies to process this run"
+        required: false
+        default: "50"
+      dry_run:
+        description: "1 = run pipeline but do NOT write"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-enrichment-health
+  cancel-in-progress: false
+
+jobs:
+  enrich-and-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run enrichment (Serper only, 50 companies)
+        id: enrich
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          MAX_COMPANIES: ${{ github.event.inputs.max_companies || '50' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+          USE_SERPER: "1"
+          USE_SERPAPI: "0"
+          USE_FIRECRAWL: "0"
+          ALLOW_STEALTH: "0"
+          SUMMARY_JSON_PATH: ${{ github.workspace }}/enrich_summary.json
+          REQUEST_PAUSE_SECONDS: "1.0"
+        run: python scripts/enrich_company_activity.py
+
+      - name: Send health-check email (always)
+        if: always()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SUMMARY_JSON_PATH: ${{ github.workspace }}/enrich_summary.json
+        run: python scripts/send_health_report.py
