@@ -589,5 +589,128 @@ class TestUpsertPayload(unittest.TestCase):
             eca.ACTIVITY_COLUMNS = orig
 
 
+class TestEmptyMeaning(unittest.TestCase):
+    """FIX 1 — reject 'no determinable activity / shell / no data' boilerplate."""
+
+    def test_blocks_german_no_activity_phrases(self):
+        self.assertTrue(eca.is_empty_meaning(
+            "Kein operativer Geschäftsbetrieb feststellbar.", "نص عربي"))
+        self.assertTrue(eca.is_empty_meaning("Keine Angabe.", "نص عربي"))
+        self.assertTrue(eca.is_empty_meaning("Nicht ermittelbar.", "نص عربي"))
+
+    def test_blocks_holding_shell_phrase_but_not_plain_asset_mgmt(self):
+        self.assertTrue(eca.is_empty_meaning(
+            "Verwaltung eigenen Vermögens ohne eigenen Geschäftsbetrieb.",
+            "نشاط عربي"))
+        # Plain Vermögensverwaltung is a REAL activity -> must NOT be blocked.
+        self.assertFalse(eca.is_empty_meaning(
+            "Vermögensverwaltung und das Halten von Beteiligungen.",
+            "إدارة الأصول وحيازة الحصص."))
+
+    def test_blocks_arabic_no_activity_phrases(self):
+        self.assertTrue(eca.is_empty_meaning(
+            "Handel mit Waren.", "لا يمكن تحديد أي نشاط تجاري تشغيلي للشركة."))
+        self.assertTrue(eca.is_empty_meaning("Handel mit Waren.", "غير محدد"))
+
+    def test_empty_strings_are_empty_meaning(self):
+        self.assertTrue(eca.is_empty_meaning("", "نص"))
+        self.assertTrue(eca.is_empty_meaning("Handel mit Waren.", ""))
+
+    def test_real_activity_is_kept(self):
+        self.assertFalse(eca.is_empty_meaning(
+            "Betrieb eines Restaurants und Catering.",
+            "تشغيل مطعم وتقديم خدمات الطعام."))
+
+    def test_process_company_rejects_empty_meaning_after_translation(self):
+        # Identity matches and a full purpose is parsed, but the TRANSLATION is a
+        # shell phrase -> rejected, not accepted, and not stored.
+        co = {"entity_id": "em1", "debtor_name": "Shell GmbH",
+              "debtor_city": "Berlin", "registry_court": "Charlottenburg",
+              "registry_type": "HRB", "registry_number": "224488"}
+        search = [{"url": "https://northdata.com/shell", "title": "Shell GmbH",
+                   "description": ("Amtsgericht Charlottenburg HRB 224488. "
+                                   "Gegenstand des Unternehmens: Verwaltung "
+                                   "eigenen Vermögens ohne eigenen "
+                                   "Geschäftsbetrieb.")}]
+
+        def translate(de):
+            return (de, "لا يمكن تحديد أي نشاط")
+
+        d = eca.process_company(
+            co, search_fn=lambda q: search,
+            scrape_fn=lambda u, stealth=False: "", translate_fn=translate)
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.reason, eca.EMPTY_MEANING_REASON)
+        # matched_hrb kept for the log; row is NOT built/stored.
+        self.assertEqual(d.matched_hrb, "224488")
+
+
+class TestEnvDefaults(unittest.TestCase):
+    def test_allow_stealth_defaults_off(self):
+        # FIX 2 — Stealth is OFF unless ALLOW_STEALTH is explicitly truthy.
+        saved = os.environ.pop("ALLOW_STEALTH", None)
+        try:
+            self.assertFalse(eca.truthy(os.environ.get("ALLOW_STEALTH", "0")))
+        finally:
+            if saved is not None:
+                os.environ["ALLOW_STEALTH"] = saved
+
+    def test_default_order_is_deterministic_and_allowed(self):
+        self.assertEqual(eca.DEFAULT_ORDER, "entity_id.asc")
+        self.assertIn(eca.DEFAULT_ORDER, eca.ALLOWED_ORDERS)
+
+
+class TestFetchCandidatesResume(unittest.TestCase):
+    """FIX 3 — reruns resume by excluding already-enriched entities; batch size."""
+
+    def _patch_postgrest(self, view_rows, existing):
+        captured = {"view_path": None}
+
+        def fake(method, path, base, key, body=None, prefer=None):
+            if path.startswith(eca.ACTIVITY_TABLE):
+                return existing
+            captured["view_path"] = path
+            return view_rows
+
+        return fake, captured
+
+    def test_skips_already_enriched_and_honors_batch_size(self):
+        view_rows = [{"entity_id": f"e{i}", "debtor_name": f"C{i}"}
+                     for i in range(6)]
+        existing = [{"entity_id": "e1"}, {"entity_id": "e3"}]
+        fake, _ = self._patch_postgrest(view_rows, existing)
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            out = eca.fetch_candidates("b", "k", max_companies=2, fetch_limit=100)
+        finally:
+            eca.postgrest = orig
+        ids = [r["entity_id"] for r in out]
+        self.assertNotIn("e1", ids)        # already enriched -> skipped
+        self.assertNotIn("e3", ids)
+        self.assertEqual(len(out), 2)      # batch size (MAX_COMPANIES) honored
+        self.assertEqual(ids, ["e0", "e2"])
+
+    def test_invalid_order_falls_back_to_default(self):
+        fake, captured = self._patch_postgrest([], [])
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            eca.fetch_candidates("b", "k", 5, 100, order="; DROP TABLE x")
+        finally:
+            eca.postgrest = orig
+        self.assertIn(f"order={eca.DEFAULT_ORDER}", captured["view_path"])
+
+    def test_valid_order_is_used(self):
+        fake, captured = self._patch_postgrest([], [])
+        orig = eca.postgrest
+        eca.postgrest = fake
+        try:
+            eca.fetch_candidates("b", "k", 5, 100, order="announcement_date.desc")
+        finally:
+            eca.postgrest = orig
+        self.assertIn("order=announcement_date.desc", captured["view_path"])
+
+
 if __name__ == "__main__":
     unittest.main()
