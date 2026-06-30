@@ -13,10 +13,12 @@ Run with:  python -m unittest discover -s tests
 (stdlib unittest only — no extra test dependency required.)
 """
 
+import json
 import os
 import re
 import sys
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(
@@ -972,6 +974,129 @@ class TestSerpApi(unittest.TestCase):
         self.assertEqual(d.serpapi_searches, 1)
         self.assertTrue(d.entity_id)
         self.assertTrue(d.reason)        # recordable in company_activity_attempts
+
+
+class TestSerper(unittest.TestCase):
+    """PASS 0 — Serper.dev snippets reuse the same gate/filter, no scraping."""
+
+    def _translate(self, de):
+        return (f"de:{de[:20]}", "ar:عربي")
+
+    def _co(self, court="Köln", num="12345"):
+        return {"entity_id": "r1", "debtor_name": "Foo GmbH", "debtor_city": "Köln",
+                "registry_court": court, "registry_type": "HRB",
+                "registry_number": num}
+
+    def _no_scrape(self, url, stealth=False):
+        raise AssertionError("Serper path must never scrape")
+
+    def test_serper_search_posts_with_apikey_header_and_normalizes(self):
+        captured = {}
+
+        def fake_http_json(method, url, headers, body=None, timeout=60):
+            captured.update(method=method, url=url, headers=headers, body=body)
+            return 200, {"organic": [
+                {"link": "https://northdata.com/x", "title": "Foo GmbH",
+                 "snippet": "Amtsgericht Köln HRB 12345. Gegenstand: Handel."},
+                {"title": "no link"},  # tolerate missing link/snippet
+            ]}
+
+        orig = eca.http_json
+        eca.http_json = fake_http_json
+        try:
+            out = eca.serper_search("Foo GmbH Köln Handelsregister", "KEY")
+        finally:
+            eca.http_json = orig
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["url"], "https://google.serper.dev/search")
+        self.assertEqual(captured["headers"].get("X-API-KEY"), "KEY")
+        self.assertEqual(captured["body"]["q"], "Foo GmbH Köln Handelsregister")
+        self.assertEqual(out[0]["url"], "https://northdata.com/x")
+        self.assertIn("HRB 12345", out[0]["description"])
+        self.assertEqual(out[1]["url"], "")
+
+    def test_serper_search_raises_on_non_200(self):
+        def fake(method, url, headers, body=None, timeout=60):
+            return 403, {"message": "forbidden"}
+
+        orig = eca.http_json
+        eca.http_json = fake
+        try:
+            with self.assertRaises(RuntimeError):
+                eca.serper_search("q", "BAD")
+        finally:
+            eca.http_json = orig
+
+    def test_serper_accepts_complete_snippet_without_scraping(self):
+        serp = [{"url": "https://northdata.com/foo", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Handel mit Möbeln.")}]
+        d = eca.process_company(
+            self._co(), serper_fn=lambda q: serp,
+            scrape_fn=self._no_scrape, translate_fn=self._translate)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.provider, "serper")
+        self.assertEqual(d.source, "aggregator")
+        self.assertEqual(d.pass_used, "1")
+        self.assertEqual(d.scrape_tier, "")
+        self.assertEqual(d.serper_searches, 1)
+        self.assertEqual(d.serpapi_searches, 0)
+        self.assertEqual(d.credits, 0)
+
+    def test_serper_identity_gate_rejects_wrong_court(self):
+        serp = [{"url": "https://northdata.com/x", "title": "Foo GmbH",
+                 "description": ("Amtsgericht München HRB 18311. Gegenstand des "
+                                 "Unternehmens: Hoch- und Tiefbau.")}]
+        d = eca.process_company(
+            self._co(court="Kassel", num="18311"), serper_fn=lambda q: serp,
+            scrape_fn=self._no_scrape, translate_fn=self._translate)
+        self.assertFalse(d.accepted)
+        self.assertIn("strict gate", d.reason)
+        self.assertEqual(d.serper_searches, 1)
+
+    def test_serper_empty_meaning_filter_applies(self):
+        serp = [{"url": "https://northdata.com/shell", "title": "Foo GmbH",
+                 "description": ("Amtsgericht Köln HRB 12345. Gegenstand des "
+                                 "Unternehmens: Verwaltung eigenen Vermögens "
+                                 "ohne eigenen Geschäftsbetrieb.")}]
+        d = eca.process_company(
+            self._co(), serper_fn=lambda q: serp, scrape_fn=self._no_scrape,
+            translate_fn=lambda de: (de, "نشاط"))
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.reason, eca.EMPTY_MEANING_REASON)
+        self.assertEqual(d.provider, "serper")
+
+
+class TestBuildSummary(unittest.TestCase):
+    def test_summary_has_required_keys_and_coverage(self):
+        rr = Counter()
+        rr["no snippet matched registry_number/court (strict gate)"] = 10
+        rr[eca.EMPTY_MEANING_REASON] = 2
+        s = eca.build_summary(
+            date="2026-06-30", providers_used=["serper"], processed=50,
+            serper_searches=50, accepted=20, written=20, rejected=30,
+            reject_reasons=rr, high=8, medium=12, total_enriched_now=1179,
+            eligible_total=2900)
+        for k in ("date", "providers_used", "companies_processed",
+                  "serper_searches_used", "accepted", "written", "rejected",
+                  "rejected_by_reason", "high", "medium", "total_enriched_now",
+                  "eligible_total", "coverage_percent", "ok"):
+            self.assertIn(k, s)
+        self.assertEqual(s["companies_processed"], 50)
+        self.assertEqual(s["serper_searches_used"], 50)
+        self.assertEqual(s["coverage_percent"], round(100 * 1179 / 2900, 1))
+        self.assertIsInstance(s["rejected_by_reason"], list)
+        self.assertEqual(s["rejected_by_reason"][0][0],
+                         "no snippet matched registry_number/court (strict gate)")
+        json.dumps(s)  # must be JSON-serializable
+
+    def test_summary_zero_eligible_is_safe(self):
+        s = eca.build_summary(
+            date="d", providers_used=[], processed=0, serper_searches=0,
+            accepted=0, written=0, rejected=0, reject_reasons=Counter(),
+            high=0, medium=0, total_enriched_now=0, eligible_total=0)
+        self.assertEqual(s["coverage_percent"], 0.0)
+        self.assertTrue(s["ok"])
 
 
 if __name__ == "__main__":
