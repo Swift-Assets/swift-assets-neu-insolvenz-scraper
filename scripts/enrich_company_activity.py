@@ -66,6 +66,12 @@ Environment
 * ``ORDER``                      — optional, default ``entity_id.asc`` (one of
                                    entity_id.asc/desc, announcement_date.asc/desc).
                                    Deterministic scan order for resumable batches.
+* ``RETRY_AFTER_DAYS``           — optional int, default 30. A company processed
+                                   (accepted OR rejected) within this window is
+                                   SKIPPED, so successive batches advance past the
+                                   unrecoverable head instead of re-picking it.
+                                   ``<= 0`` retries everything. Needs the attempts
+                                   ledger table (docs/phase-0053 migration).
 * ``ALLOW_STEALTH``              — optional, default ``0`` (OFF). ``1`` enables the
                                    5-credit pass-2 Tier-C Stealth fallback.
 * ``REQUEST_PAUSE_SECONDS``      — optional float, default 1.0 (politeness)
@@ -92,12 +98,16 @@ import re
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from urllib import error, parse, request
 
 SCHEMA = "swift_v2"
 ACTIVITY_TABLE = "company_activity_sources"
+# Backfill progress ledger (see docs/phase-0053-*-migration.sql). One row per
+# processed company so selection advances past already-attempted rejects.
+ATTEMPTS_TABLE = "company_activity_attempts"
+DEFAULT_RETRY_AFTER_DAYS = 30
 SOURCE_VIEW = "source_neu_insolvenz_announcements"
 
 # Exact writable columns of swift_v2.company_activity_sources. id/created_at/
@@ -770,32 +780,80 @@ ALLOWED_ORDERS = (
 DEFAULT_ORDER = "entity_id.asc"
 
 
-def fetch_candidates(base: str, key: str, max_companies: int,
-                     fetch_limit: int, order: str = DEFAULT_ORDER) -> list[dict[str, Any]]:
-    """Company entities with a registry that have NO row yet in the activity table.
+def parse_ts(s: Optional[str]) -> Optional[datetime]:
+    """Parse a PostgREST ISO timestamp to an aware UTC datetime; None on failure."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-    RESUME: every run excludes entity_ids already present in
-    ``company_activity_sources`` and returns at most ``max_companies`` (the batch
-    size), so reruns naturally advance through the backlog without reprocessing.
-    ``order`` (validated against :data:`ALLOWED_ORDERS`) makes the scan order
-    deterministic so successive batches don't keep re-scanning the same head.
+
+def load_attempts(base: str, key: str) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Load the attempts ledger -> ({entity_id: {attempts, last_attempt_at}}, ok).
+
+    ``ok`` is False when the ledger table is absent/unreadable (pre-migration);
+    callers then treat it as empty AND skip writing attempt rows (so they don't
+    crash, but the backfill cannot advance until the 0053 migration is applied).
+    """
+    try:
+        rows = postgrest(
+            "GET", f"{ATTEMPTS_TABLE}?select=entity_id,attempts,last_attempt_at",
+            base, key) or []
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] could not read {ATTEMPTS_TABLE} (treating as empty; the "
+              f"backfill will NOT advance until the 0053 migration is applied): {e}",
+              file=sys.stderr)
+        return {}, False
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        eid = r.get("entity_id")
+        if eid:
+            out[eid] = {"attempts": r.get("attempts") or 0,
+                        "last_attempt_at": r.get("last_attempt_at") or ""}
+    return out, True
+
+
+def recently_attempted(attempts_map: dict[str, dict[str, Any]],
+                       retry_after_days: int, now: datetime) -> set[str]:
+    """entity_ids whose last attempt is within the retry window (skip these).
+
+    ``retry_after_days <= 0`` disables the window (every attempt is retried).
+    """
+    if retry_after_days <= 0:
+        return set()
+    cutoff = now - timedelta(days=retry_after_days)
+    out: set[str] = set()
+    for eid, info in attempts_map.items():
+        ts = parse_ts(info.get("last_attempt_at"))
+        if ts is not None and ts >= cutoff:
+            out.add(eid)
+    return out
+
+
+def fetch_candidates(base: str, key: str, max_companies: int, fetch_limit: int,
+                     order: str = DEFAULT_ORDER,
+                     exclude: Optional[set[str]] = None,
+                     stats: Optional[dict[str, int]] = None) -> list[dict[str, Any]]:
+    """Eligible companies that have NO activity row and were NOT recently attempted.
+
+    ADVANCE: a company is selected only when it has no row in
+    ``company_activity_sources`` AND its entity_id is not in ``exclude`` (the
+    recently-attempted set from the attempts ledger). The view is scanned in
+    PAGES of ``fetch_limit`` rows (in deterministic ``order``) until
+    ``max_companies`` new candidates are found or the view is exhausted — so the
+    batch advances past the unrecoverable head however large it grows, never
+    stalling inside a single fetch window.
     """
     if order not in ALLOWED_ORDERS:
         print(f"[warn] ORDER {order!r} not allowed; using {DEFAULT_ORDER!r}",
               file=sys.stderr)
         order = DEFAULT_ORDER
+    exclude = exclude or set()
     cols = ("entity_id,debtor_name,debtor_city,registry_court,"
             "registry_type,registry_number,announcement_date")
-    path = (
-        f"{SOURCE_VIEW}?select={cols}"
-        "&subject_type=eq.company"
-        "&entity_id=not.is.null"
-        "&registry_number=not.is.null"
-        "&registry_court=not.is.null"
-        f"&order={order}"
-        f"&limit={fetch_limit}"
-    )
-    rows = postgrest("GET", path, base, key) or []
 
     # Entities already enriched — graceful if the table is absent (pre-migration).
     already: set[str] = set()
@@ -806,21 +864,64 @@ def fetch_candidates(base: str, key: str, max_companies: int,
         print(f"[warn] could not read {ACTIVITY_TABLE} (treating as empty): {e}",
               file=sys.stderr)
 
+    page = max(1, fetch_limit)
     out: list[dict[str, Any]] = []
     chosen: set[str] = set()
-    for r in rows:
-        eid = r.get("entity_id")
-        if not eid or eid in chosen or eid in already:
-            continue
-        chosen.add(eid)
-        out.append(r)
-        if len(out) >= max_companies:
+    skipped_recent = scanned = offset = 0
+    while len(out) < max_companies:
+        path = (
+            f"{SOURCE_VIEW}?select={cols}"
+            "&subject_type=eq.company"
+            "&entity_id=not.is.null"
+            "&registry_number=not.is.null"
+            "&registry_court=not.is.null"
+            f"&order={order}"
+            f"&offset={offset}&limit={page}"
+        )
+        rows = postgrest("GET", path, base, key) or []
+        if not rows:
             break
-    # RESUME visibility: how many already-done were skipped vs. selected now.
-    print(f"[resume] {len(already)} entity(ies) already enriched (skipped); "
-          f"selected {len(out)} new (batch size MAX_COMPANIES={max_companies}, "
+        scanned += len(rows)
+        for r in rows:
+            eid = r.get("entity_id")
+            if not eid or eid in chosen or eid in already:
+                continue
+            if eid in exclude:
+                skipped_recent += 1
+                continue
+            chosen.add(eid)
+            out.append(r)
+            if len(out) >= max_companies:
+                break
+        if len(rows) < page:
+            break
+        offset += page
+
+    if stats is not None:
+        stats["already_enriched"] = len(already)
+        stats["skipped_recent"] = skipped_recent
+        stats["selected"] = len(out)
+        stats["scanned"] = scanned
+    # ADVANCE visibility: enriched/recently-attempted skipped vs. new selected.
+    print(f"[resume] scanned {scanned} announcement rows; {len(already)} already "
+          f"enriched, {skipped_recent} skipped (attempted within retry window); "
+          f"selected {len(out)} new (batch MAX_COMPANIES={max_companies}, "
           f"order={order})")
     return out
+
+
+def upsert_attempt(base: str, key: str, entity_id: str, attempts: int,
+                   reason: str) -> Any:
+    """Record one processing attempt (accepted OR rejected). UPSERT on entity_id."""
+    row = {
+        "entity_id": entity_id,
+        "attempts": attempts,
+        "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+        "last_reason": (reason or "")[:500],
+    }
+    return postgrest(
+        "POST", f"{ATTEMPTS_TABLE}?on_conflict=entity_id", base, key,
+        [row], prefer="resolution=merge-duplicates,return=minimal")
 
 
 def activity_payload(d: Decision) -> dict[str, Any]:
@@ -1114,6 +1215,9 @@ def main() -> int:
     allow_stealth = truthy(os.environ.get("ALLOW_STEALTH", "0"))
     # Deterministic batch ordering for resumable backfills (see fetch_candidates).
     order = os.environ.get("ORDER", DEFAULT_ORDER).strip() or DEFAULT_ORDER
+    # Skip companies attempted within this window so the backfill ADVANCES.
+    retry_after_days = int(os.environ.get("RETRY_AFTER_DAYS",
+                                          str(DEFAULT_RETRY_AFTER_DAYS)))
 
     have_secrets = all(os.environ.get(k, "").strip() for k in (
         "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
@@ -1128,22 +1232,52 @@ def main() -> int:
     fkey = need("FIRECRAWL_API_KEY")
     okey = need("OPENAI_API_KEY")
     start = time.monotonic()
+    now = datetime.now(timezone.utc)
 
+    # Attempts ledger drives ADVANCE: skip recently-attempted, record every
+    # attempt. If the table is absent (pre-0053), proceed read-only-safe but warn
+    # that the backfill will re-pick the same head until the migration is applied.
+    attempts_map, attempts_ok = load_attempts(base, skey)
+    recent = recently_attempted(attempts_map, retry_after_days, now)
+
+    sel_stats: dict[str, int] = {}
     try:
-        candidates = fetch_candidates(base, skey, max_companies, fetch_limit, order)
+        candidates = fetch_candidates(base, skey, max_companies, fetch_limit,
+                                      order, exclude=recent, stats=sel_stats)
     except Exception as e:  # noqa: BLE001
         print(f"[fatal] cannot read candidates: {e}", file=sys.stderr)
         return 3
 
     total = len(candidates)
+    if not attempts_ok and not dry:
+        print("[warn] attempts ledger unavailable: rejects will NOT be recorded, "
+              "so the backfill cannot advance past the head. Apply the 0053 "
+              "migration first.", file=sys.stderr)
     print(f"[start] {total} candidate companies (dry_run={dry}, "
           f"max_companies={max_companies}, allow_stealth={allow_stealth}, "
-          f"order={order})")
+          f"order={order}, retry_after_days={retry_after_days}, "
+          f"attempts_ledger={'on' if attempts_ok else 'ABSENT'})")
 
     processed = accepted = rejected = written = credits = 0
-    normal_credits = stealth_credits = 0
+    normal_credits = stealth_credits = newly_attempted = 0
     tiers = {"A": 0, "B": 0, "C": 0}
     reject_reasons: Counter[str] = Counter()
+
+    def record_attempt(entity_id: Optional[str], reason: str) -> None:
+        """Persist one processing attempt so the next batch advances past it."""
+        nonlocal newly_attempted
+        if not entity_id:
+            return
+        newly_attempted += 1
+        if dry or not attempts_ok:
+            return  # dry run writes nothing; pre-migration has no ledger to write
+        prev = attempts_map.get(entity_id, {}).get("attempts", 0)
+        try:
+            upsert_attempt(base, skey, entity_id, prev + 1, reason)
+        except Exception as e:  # noqa: BLE001 — ledger write must not kill the run
+            print(f"[warn] could not record attempt for {entity_id}: {e}",
+                  file=sys.stderr)
+
     for i, co in enumerate(candidates, 1):
         if time.monotonic() - start > time_budget:
             print(f"[stop] time budget reached after {i - 1} companies")
@@ -1161,6 +1295,7 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 — never let one company kill the run
             rejected += 1
             reject_reasons[f"error: {type(e).__name__}"] += 1
+            record_attempt(co.get("entity_id"), f"error: {type(e).__name__}")
             print(f"[{i}/{total}] ERROR  {name!r}: {e}")
             time.sleep(pause)
             continue
@@ -1179,6 +1314,7 @@ def main() -> int:
         if not d.accepted:
             rejected += 1
             reject_reasons[(d.reason or "unknown").strip().rstrip(";").strip()] += 1
+            record_attempt(co.get("entity_id"), d.reason or "rejected")
             print(f"[{i}/{total}] REJECT {name!r}: {d.reason} [{trace}]")
             time.sleep(pause)
             continue
@@ -1190,21 +1326,26 @@ def main() -> int:
             print(f"          ref={d.source_ref}")
             print(f"          de={d.purpose_de!r}")
             print(f"          ar={d.purpose_ar!r}")
+            record_attempt(co.get("entity_id"), "accepted")
         else:
             try:
                 upsert_activity(base, skey, d)
                 written += 1
                 print(f"[{i}/{total}] WRITE  {name!r} -> source={d.source} "
                       f"conf={d.confidence} hrb={d.matched_hrb} [{trace}]")
+                record_attempt(co.get("entity_id"), "accepted")
             except Exception as e:  # noqa: BLE001
                 reject_reasons["write failed (db error)"] += 1
+                # Do NOT record an attempt on write failure -> retried next run.
                 print(f"[{i}/{total}] WRITE FAILED {name!r}: {e}")
         time.sleep(pause)
 
     empty_meaning = reject_reasons.get(EMPTY_MEANING_REASON, 0)
     print("=" * 74)
-    print(f"[summary] processed={processed} accepted={accepted} "
-          f"written={written} rejected={rejected} "
+    print(f"[summary] selected={total} "
+          f"skipped_recently_attempted={sel_stats.get('skipped_recent', 0)} "
+          f"newly_attempted={newly_attempted} processed={processed} "
+          f"accepted={accepted} written={written} rejected={rejected} "
           f"empty_meaning_skipped={empty_meaning} dry_run={dry}")
     print(f"[summary] pass2 tiers A={tiers['A']} B={tiers['B']} C={tiers['C']}")
     print(f"[summary] credits total={credits} "
